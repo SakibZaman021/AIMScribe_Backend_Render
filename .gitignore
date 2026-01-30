@@ -1,0 +1,49 @@
+# Environment variables (contains secrets/API keys)
+.env
+
+# Python virtual environment
+venv/
+.venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+
+# Logs
+logs/
+*.log
+
+# Audio files (large binary files)
+audio/
+
+# ChromaDB local storage
+chromadb/
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Test / Coverage
+.pytest_cache/
+htmlcov/
+.coverage
+
+# My recorder project (if not part of main app)
+my_recorder_project/

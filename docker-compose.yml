@@ -1,0 +1,104 @@
+version: '3.8'
+
+# ================================================================
+# AIMScribe Backend - Docker Compose
+# Starts PostgreSQL, Redis, and MinIO services
+# ================================================================
+# Usage:
+#   docker-compose up -d      (Start all services)
+#   docker-compose down       (Stop all services)
+#   docker-compose logs -f    (View logs)
+# ================================================================
+
+services:
+  # ================================================================
+  # PostgreSQL Database
+  # ================================================================
+  postgres:
+    image: postgres:14
+    container_name: aimscribe-postgres
+    environment:
+      POSTGRES_DB: aimscribe_db
+      POSTGRES_USER: aimscribe_user
+      POSTGRES_PASSWORD: aimscribe123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_database.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aimscribe_user -d aimscribe_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ================================================================
+  # Redis (Job Queue & Caching)
+  # ================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: aimscribe-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ================================================================
+  # MinIO (Object Storage for Audio Files)
+  # ================================================================
+  minio:
+    image: minio/minio
+    container_name: aimscribe-minio
+    environment:
+      MINIO_ROOT_USER: aimscribe
+      MINIO_ROOT_PASSWORD: aimscribe123
+    ports:
+      - "9000:9000"   # API
+      - "9001:9001"   # Console
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+
+  # ================================================================
+  # MinIO Setup (Creates bucket on first run)
+  # ================================================================
+  minio-setup:
+    image: minio/mc
+    container_name: aimscribe-minio-setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set aimscribe http://minio:9000 aimscribe aimscribe123;
+      mc mb --ignore-existing aimscribe/aimscribe-audio;
+      mc anonymous set download aimscribe/aimscribe-audio;
+      echo 'Bucket created successfully';
+      exit 0;
+      "
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+
+networks:
+  default:
+    name: aimscribe-network

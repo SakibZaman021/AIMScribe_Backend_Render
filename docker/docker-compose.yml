@@ -1,0 +1,219 @@
+# ================================================================
+# AIMScribe AI Backend v5.1 - Docker Compose with MinIO + Redis
+# ================================================================
+# Run: docker-compose up --build
+
+# version: '3.8'
+
+services:
+  # ================================================================
+  # AIMScribe AI Backend API (Lightweight)
+  # ================================================================
+  aimscribe-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: aimscribe-api
+    restart: unless-stopped
+    ports:
+      - "${SERVER_PORT:-6000}:6000"
+    environment:
+      # Azure OpenAI
+      - AZURE_TRANSCRIBE_ENDPOINT=${AZURE_TRANSCRIBE_ENDPOINT}
+      - AZURE_TRANSCRIBE_API_KEY=${AZURE_TRANSCRIBE_API_KEY}
+      - AZURE_TRANSCRIBE_DEPLOYMENT=${AZURE_TRANSCRIBE_DEPLOYMENT:-gpt-4o-transcribe}
+      - AZURE_NER_ENDPOINT=${AZURE_NER_ENDPOINT}
+      - AZURE_NER_API_KEY=${AZURE_NER_API_KEY}
+      - AZURE_NER_DEPLOYMENT=${AZURE_NER_DEPLOYMENT:-gpt-4}
+      - AZURE_API_VERSION=${AZURE_API_VERSION:-2024-02-15-preview}
+
+      # PostgreSQL
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-aimscribe_db}
+      - POSTGRES_USER=${POSTGRES_USER:-aimscribe_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+
+      # MinIO
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-aimscribe}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-aimscribe123}
+      - MINIO_BUCKET=${MINIO_BUCKET:-aimscribe-audio}
+      - MINIO_SECURE=false
+
+      # Redis
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+
+      # Server
+      - SERVER_PORT=6000
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - PROMPTS_DIR=/app/src/prompts
+      - NER_TRIGGER_CLIPS=${NER_TRIGGER_CLIPS:-2}
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+    volumes:
+      - ../src/prompts:/app/src/prompts:ro
+
+    networks:
+      - aimscribe-network
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ================================================================
+  # AIMScribe Worker (Async Processing)
+  # ================================================================
+  aimscribe-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    container_name: aimscribe-worker
+    restart: unless-stopped
+    environment:
+      # Azure OpenAI
+      - AZURE_TRANSCRIBE_ENDPOINT=${AZURE_TRANSCRIBE_ENDPOINT}
+      - AZURE_TRANSCRIBE_API_KEY=${AZURE_TRANSCRIBE_API_KEY}
+      - AZURE_TRANSCRIBE_DEPLOYMENT=${AZURE_TRANSCRIBE_DEPLOYMENT:-gpt-4o-transcribe}
+      - AZURE_NER_ENDPOINT=${AZURE_NER_ENDPOINT}
+      - AZURE_NER_API_KEY=${AZURE_NER_API_KEY}
+      - AZURE_NER_DEPLOYMENT=${AZURE_NER_DEPLOYMENT:-gpt-4}
+      - AZURE_API_VERSION=${AZURE_API_VERSION:-2024-02-15-preview}
+
+      # PostgreSQL
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-aimscribe_db}
+      - POSTGRES_USER=${POSTGRES_USER:-aimscribe_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+
+      # MinIO
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-aimscribe}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-aimscribe123}
+      - MINIO_BUCKET=${MINIO_BUCKET:-aimscribe-audio}
+      - MINIO_SECURE=false
+
+      # Redis
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+
+      # Worker
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - PROMPTS_DIR=/app/src/prompts
+      - NER_TRIGGER_CLIPS=${NER_TRIGGER_CLIPS:-2}
+      - WORKER_CONCURRENCY=${WORKER_CONCURRENCY:-1}
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+    volumes:
+      - ../src/prompts:/app/src/prompts:ro
+      - worker_temp:/tmp/audio
+
+    networks:
+      - aimscribe-network
+
+    # Can scale workers
+    deploy:
+      replicas: 1
+
+  # ================================================================
+  # PostgreSQL Database
+  # ================================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: aimscribe-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-aimscribe_db}
+      - POSTGRES_USER=${POSTGRES_USER:-aimscribe_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_EXTERNAL_PORT:-5432}:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aimscribe_user} -d ${POSTGRES_DB:-aimscribe_db}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - aimscribe-network
+
+  # ================================================================
+  # Redis Message Queue
+  # ================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: aimscribe-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_EXTERNAL_PORT:-6379}:6379"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aimscribe-network
+
+  # ================================================================
+  # MinIO Object Storage
+  # ================================================================
+  minio:
+    image: minio/minio:latest
+    container_name: aimscribe-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ACCESS_KEY:-aimscribe}
+      - MINIO_ROOT_PASSWORD=${MINIO_SECRET_KEY:-aimscribe123}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - aimscribe-network
+
+networks:
+  aimscribe-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    name: aimscribe_postgres_data
+  redis_data:
+    name: aimscribe_redis_data
+  minio_data:
+    name: aimscribe_minio_data
+  worker_temp:
+    name: aimscribe_worker_temp
