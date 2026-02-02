@@ -45,7 +45,7 @@ class Settings(BaseSettings):
         description="Azure OpenAI API key for NER"
     )
     azure_ner_deployment: str = Field(
-        default="gpt-4",
+        default="gpt-5.2-chat",
         description="Azure OpenAI deployment name for NER"
     )
     azure_api_version: str = Field(

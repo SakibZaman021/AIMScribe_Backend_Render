@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from config import settings
 from database.postgres_async import AsyncPostgreSQLDatabase
 from storage.minio_client import get_minio_client, MinIOClient
-from queue.redis_async import AsyncRedisClient, push_transcription_job_async
+from message_queue.redis_async import AsyncRedisClient, push_transcription_job_async
 
 # Configure logging
 logging.basicConfig(
@@ -61,6 +61,20 @@ class StatusResponse(BaseModel):
     has_ner: bool
     ner_version: int
     updated_at: str
+
+
+class DoctorReviewRequest(BaseModel):
+    session_id: str
+    doctor_id: str
+    field_name: str
+    original_value: object = None
+    edited_value: object = None
+
+
+class PrescriptionRequest(BaseModel):
+    session_id: str
+    doctor_id: str
+    prescription: dict
 
 
 # ============================================================================
@@ -332,18 +346,96 @@ async def get_transcript(session_id: str):
 
 @app.get("/api/v1/ner/{session_id}")
 async def get_ner_result(session_id: str):
-    """Get latest NER result."""
+    """Get latest NER result with individual fields."""
     try:
         result = await ctx.db.get_latest_ner(session_id)
         if not result:
-            return {"ner_json": None, "version": 0}
+            return {"version": 0, "fields": None}
+
+        fields = {
+            "patient_name": result.get('patient_name'),
+            "age": result.get('age'),
+            "gender": result.get('gender'),
+            "chief_complaints": result.get('chief_complaints'),
+            "drug_history": result.get('drug_history'),
+            "on_examination": result.get('on_examination'),
+            "systemic_examination": result.get('systemic_examination'),
+            "additional_notes": result.get('additional_notes'),
+            "investigations": result.get('investigations'),
+            "diagnosis": result.get('diagnosis'),
+            "medications": result.get('medications'),
+            "advice": result.get('advice'),
+            "follow_up": result.get('follow_up'),
+            "health_screening": result.get('health_screening'),
+        }
 
         return {
-            "ner_json": result['ner_json'],
             "version": result['version'],
             "is_final": result['is_final'],
-            "created_at": result['created_at']
+            "created_at": result['created_at'],
+            "fields": fields,
+            "full_ner_json": result.get('full_ner_json')
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Doctor Reviews
+# ============================================================================
+
+@app.post("/api/v1/doctor-review")
+async def save_doctor_review(request: DoctorReviewRequest):
+    """Save a doctor's edit to a NER field."""
+    try:
+        review_id = await ctx.db.save_doctor_review(
+            session_id=request.session_id,
+            doctor_id=request.doctor_id,
+            field_name=request.field_name,
+            original_value=request.original_value,
+            edited_value=request.edited_value
+        )
+        return {"review_id": review_id, "status": "saved"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/doctor-review/{session_id}")
+async def get_doctor_reviews(session_id: str):
+    """Get all doctor reviews for a session."""
+    try:
+        reviews = await ctx.db.get_doctor_reviews(session_id)
+        return {"session_id": session_id, "reviews": reviews}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Prescriptions
+# ============================================================================
+
+@app.post("/api/v1/prescription")
+async def save_prescription(request: PrescriptionRequest):
+    """Save final prescription data (doctor presses Print)."""
+    try:
+        prescription_id = await ctx.db.save_prescription(
+            session_id=request.session_id,
+            doctor_id=request.doctor_id,
+            prescription=request.prescription
+        )
+        return {"prescription_id": prescription_id, "status": "saved"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/prescription/{session_id}")
+async def get_prescription(session_id: str):
+    """Get latest prescription for a session."""
+    try:
+        prescription = await ctx.db.get_prescription(session_id)
+        if not prescription:
+            return {"session_id": session_id, "prescription": None}
+        return {"session_id": session_id, "prescription": prescription}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

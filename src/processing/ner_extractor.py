@@ -34,8 +34,8 @@ class NERExtractor:
             api_key=settings.azure_ner_api_key,
             api_version=settings.azure_api_version,
             deployment_name=settings.azure_ner_deployment,
-            temperature=0.1,  # Low temperature for extraction
-            max_tokens=4000
+            # temperature=0.1,  # GPT-5.2 only supports default temperature (1)
+            max_completion_tokens=4000  # GPT-5.2 requires max_completion_tokens instead of max_tokens
         )
         self.prompt_loader = get_prompt_loader()
         

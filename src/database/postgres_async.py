@@ -105,16 +105,67 @@ class AsyncPostgreSQLDatabase:
                 )
             ''')
 
-            # NER results table
+            # NER results table (individual columns per medical field)
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS ner_results (
                     id SERIAL PRIMARY KEY,
                     session_id UUID REFERENCES sessions(session_id) ON DELETE CASCADE,
                     version INTEGER NOT NULL,
-                    ner_json JSONB NOT NULL,
+                    patient_name TEXT,
+                    age TEXT,
+                    gender TEXT,
+                    chief_complaints JSONB,
+                    drug_history JSONB,
+                    on_examination JSONB,
+                    systemic_examination JSONB,
+                    additional_notes JSONB,
+                    investigations JSONB,
+                    diagnosis JSONB,
+                    medications JSONB,
+                    advice JSONB,
+                    follow_up JSONB,
+                    health_screening JSONB,
+                    full_ner_json JSONB NOT NULL,
                     is_final BOOLEAN DEFAULT FALSE,
                     extraction_method VARCHAR(50) DEFAULT 'langchain_agent',
                     prompt_version VARCHAR(20) DEFAULT '1.0.0',
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            # Doctor reviews table (row-per-change tracking)
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS doctor_reviews (
+                    id SERIAL PRIMARY KEY,
+                    session_id UUID REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    doctor_id VARCHAR(100) NOT NULL,
+                    field_name VARCHAR(100) NOT NULL,
+                    original_value JSONB,
+                    edited_value JSONB,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            # Prescription data table (saved when doctor presses Print)
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS prescription_data (
+                    id SERIAL PRIMARY KEY,
+                    session_id UUID REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    doctor_id VARCHAR(100) NOT NULL,
+                    patient_name TEXT,
+                    age TEXT,
+                    gender TEXT,
+                    chief_complaints JSONB,
+                    drug_history JSONB,
+                    on_examination JSONB,
+                    systemic_examination JSONB,
+                    additional_notes JSONB,
+                    investigations JSONB,
+                    diagnosis JSONB,
+                    medications JSONB,
+                    advice JSONB,
+                    follow_up JSONB,
+                    health_screening JSONB,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -174,6 +225,8 @@ class AsyncPostgreSQLDatabase:
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_clips_session ON clips(session_id)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_ner_session ON ner_results(session_id)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_doctor_reviews_session ON doctor_reviews(session_id)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_prescription_session ON prescription_data(session_id)')
 
         logger.info("Async PostgreSQL database initialized")
 
@@ -294,6 +347,37 @@ class AsyncPostgreSQLDatabase:
 
     # ========== NER Operations ==========
 
+    # Field mapping: NER JSON key -> database column name
+    NER_FIELD_MAP = {
+        'Patient Name': 'patient_name',
+        'Age': 'age',
+        'Gender': 'gender',
+        'Chief Complaints (English)': 'chief_complaints',
+        'Drug History': 'drug_history',
+        'On Examination': 'on_examination',
+        'Systemic Examination': 'systemic_examination',
+        'Additional Notes': 'additional_notes',
+        'Investigations (English)': 'investigations',
+        'Diagnosis (English)': 'diagnosis',
+        'Medications': 'medications',
+        'Advice (Bengali)': 'advice',
+        'Follow Up (Bengali)': 'follow_up',
+        'Health Screening': 'health_screening',
+    }
+
+    def _decompose_ner_json(self, ner_json: dict) -> dict:
+        """Extract individual fields from NER dict for column storage."""
+        fields = {}
+        for json_key, col_name in self.NER_FIELD_MAP.items():
+            value = ner_json.get(json_key)
+            if col_name in ('patient_name', 'age', 'gender'):
+                # Scalar text fields
+                fields[col_name] = str(value) if value is not None else None
+            else:
+                # JSONB fields - store as JSON string for asyncpg
+                fields[col_name] = json.dumps(value) if value is not None else None
+        return fields
+
     async def save_ner_result(
         self,
         session_id: str,
@@ -302,24 +386,40 @@ class AsyncPostgreSQLDatabase:
         method: str = 'langchain_agent',
         prompt_version: str = '1.0.0'
     ) -> int:
-        """Save NER extraction result."""
+        """Save NER extraction result with individual columns."""
+        fields = self._decompose_ner_json(ner_json)
+
         async with self._pool.acquire() as conn:
             # Get next version
             version = await conn.fetchval('''
                 SELECT COALESCE(MAX(version), 0) + 1 FROM ner_results WHERE session_id = $1
             ''', session_id)
 
-            # Insert result
             result_id = await conn.fetchval('''
-                INSERT INTO ner_results (session_id, version, ner_json, is_final, extraction_method, prompt_version)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                INSERT INTO ner_results (
+                    session_id, version,
+                    patient_name, age, gender,
+                    chief_complaints, drug_history, on_examination,
+                    systemic_examination, additional_notes, investigations,
+                    diagnosis, medications, advice, follow_up, health_screening,
+                    full_ner_json, is_final, extraction_method, prompt_version
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
                 RETURNING id
-            ''', session_id, version, json.dumps(ner_json), is_final, method, prompt_version)
+            ''',
+                session_id, version,
+                fields['patient_name'], fields['age'], fields['gender'],
+                fields['chief_complaints'], fields['drug_history'], fields['on_examination'],
+                fields['systemic_examination'], fields['additional_notes'], fields['investigations'],
+                fields['diagnosis'], fields['medications'], fields['advice'],
+                fields['follow_up'], fields['health_screening'],
+                json.dumps(ner_json), is_final, method, prompt_version
+            )
 
             return result_id
 
     async def get_latest_ner(self, session_id: str) -> Optional[Dict]:
-        """Get latest NER result."""
+        """Get latest NER result with individual columns."""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow('''
                 SELECT * FROM ner_results
@@ -327,9 +427,112 @@ class AsyncPostgreSQLDatabase:
             ''', session_id)
             if row:
                 result = dict(row)
-                # Parse JSON if stored as string
-                if isinstance(result.get('ner_json'), str):
-                    result['ner_json'] = json.loads(result['ner_json'])
+                # Parse JSONB fields that asyncpg returns as strings
+                for col_name in self.NER_FIELD_MAP.values():
+                    if col_name in ('patient_name', 'age', 'gender'):
+                        continue
+                    val = result.get(col_name)
+                    if isinstance(val, str):
+                        try:
+                            result[col_name] = json.loads(val)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                if isinstance(result.get('full_ner_json'), str):
+                    result['full_ner_json'] = json.loads(result['full_ner_json'])
+                return result
+            return None
+
+    # ========== Doctor Review Operations ==========
+
+    async def save_doctor_review(
+        self,
+        session_id: str,
+        doctor_id: str,
+        field_name: str,
+        original_value: Any,
+        edited_value: Any
+    ) -> int:
+        """Save a single field edit by a doctor."""
+        async with self._pool.acquire() as conn:
+            result_id = await conn.fetchval('''
+                INSERT INTO doctor_reviews (session_id, doctor_id, field_name, original_value, edited_value)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
+            ''',
+                session_id, doctor_id, field_name,
+                json.dumps(original_value), json.dumps(edited_value)
+            )
+            return result_id
+
+    async def get_doctor_reviews(self, session_id: str) -> List[Dict]:
+        """Get all doctor reviews for a session."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch('''
+                SELECT * FROM doctor_reviews
+                WHERE session_id = $1 ORDER BY created_at ASC
+            ''', session_id)
+            results = []
+            for row in rows:
+                r = dict(row)
+                for key in ('original_value', 'edited_value'):
+                    if isinstance(r.get(key), str):
+                        try:
+                            r[key] = json.loads(r[key])
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                results.append(r)
+            return results
+
+    # ========== Prescription Operations ==========
+
+    async def save_prescription(
+        self,
+        session_id: str,
+        doctor_id: str,
+        prescription: dict
+    ) -> int:
+        """Save final prescription data (when doctor presses Print)."""
+        fields = self._decompose_ner_json(prescription)
+
+        async with self._pool.acquire() as conn:
+            result_id = await conn.fetchval('''
+                INSERT INTO prescription_data (
+                    session_id, doctor_id,
+                    patient_name, age, gender,
+                    chief_complaints, drug_history, on_examination,
+                    systemic_examination, additional_notes, investigations,
+                    diagnosis, medications, advice, follow_up, health_screening
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                RETURNING id
+            ''',
+                session_id, doctor_id,
+                fields['patient_name'], fields['age'], fields['gender'],
+                fields['chief_complaints'], fields['drug_history'], fields['on_examination'],
+                fields['systemic_examination'], fields['additional_notes'], fields['investigations'],
+                fields['diagnosis'], fields['medications'], fields['advice'],
+                fields['follow_up'], fields['health_screening']
+            )
+            return result_id
+
+    async def get_prescription(self, session_id: str) -> Optional[Dict]:
+        """Get latest prescription for a session."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow('''
+                SELECT * FROM prescription_data
+                WHERE session_id = $1 ORDER BY created_at DESC LIMIT 1
+            ''', session_id)
+            if row:
+                result = dict(row)
+                for col_name in self.NER_FIELD_MAP.values():
+                    if col_name in ('patient_name', 'age', 'gender'):
+                        continue
+                    val = result.get(col_name)
+                    if isinstance(val, str):
+                        try:
+                            result[col_name] = json.loads(val)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
                 return result
             return None
 

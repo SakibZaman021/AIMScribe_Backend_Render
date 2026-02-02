@@ -13,11 +13,11 @@ from typing import Optional
 # Add src to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from queue.redis_async import AsyncRedisClient, TRANSCRIPTION_QUEUE, DEAD_LETTER_QUEUE
+from message_queue.redis_async import AsyncRedisClient, TRANSCRIPTION_QUEUE, DEAD_LETTER_QUEUE
 from storage.minio_client import get_minio_client
 from database.postgres_async import AsyncPostgreSQLDatabase
 from config import settings
-from processing.transcriber_v2 import TranscriberV2
+from processing.transcriber_v4 import TranscriberV4
 from processing.ner_extractor import NERExtractor
 
 # Configure Logging
@@ -47,8 +47,8 @@ class AsyncAIMScribeWorker:
 
         # Sync clients (MinIO, AI processing)
         self.minio = get_minio_client()
-        # Using GPT-4o-transcribe for Bengali audio with speaker labeling
-        self.transcriber = TranscriberV2()
+        # Using GPT-4o-transcribe-diarize via Audio Transcriptions API
+        self.transcriber = TranscriberV4()
         self.ner_extractor = NERExtractor()
 
         # State

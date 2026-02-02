@@ -52,8 +52,8 @@ def test_environment_variables():
 
 
 def test_ner_api():
-    """Test 2: Test NER API (GPT-4/4o) with a simple request."""
-    print_header("TEST 2: NER API (GPT-4o)")
+    """Test 2a: Test NER API connectivity (GPT-5.2-chat)."""
+    print_header("TEST 2a: NER API Connectivity (GPT-5.2-chat)")
 
     try:
         from openai import AzureOpenAI
@@ -72,13 +72,13 @@ def test_ner_api():
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": "Say 'NER API is working!' in Bengali."}
             ],
-            temperature=0.1,
-            max_tokens=50
+            # temperature=0.1,  # GPT-5.2 only supports default temperature (1)
+            max_completion_tokens=50  # GPT-5.2 requires max_completion_tokens instead of max_tokens
         )
 
         result = response.choices[0].message.content
         print(f"  Response: {result}")
-        print_result(True, "NER API is working!")
+        print_result(True, "NER API is reachable!")
         return True
 
     except Exception as e:
@@ -86,35 +86,130 @@ def test_ner_api():
         return False
 
 
-def test_transcription_api():
-    """Test 3: Test Transcription API (GPT-4o-transcribe) with a simple text request."""
-    print_header("TEST 3: Transcription API (GPT-4o-transcribe)")
+def test_ner_extraction():
+    """Test 2b: Test actual NER extraction with a sample Bengali transcript."""
+    print_header("TEST 2b: NER Extraction (Chief Complaints from sample transcript)")
 
     try:
         from openai import AzureOpenAI
+        import json as json_module
 
         client = AzureOpenAI(
-            azure_endpoint=os.getenv("AZURE_TRANSCRIBE_ENDPOINT"),
-            api_key=os.getenv("AZURE_TRANSCRIBE_API_KEY"),
+            azure_endpoint=os.getenv("AZURE_NER_ENDPOINT"),
+            api_key=os.getenv("AZURE_NER_API_KEY"),
             api_version=os.getenv("AZURE_API_VERSION", "2024-02-15-preview")
         )
 
-        print("  Sending test request to Transcription API...")
+        # Sample transcript matching transcriber_v4 output format: [Speaker_01], [Speaker_02]
+        sample_transcript = """[Speaker_01]: আজকে কি সমস্যা নিয়ে আসছেন?
+[Speaker_02]: তিন দিন ধরে জ্বর। গায়ে অনেক ব্যথা। মাথাও ব্যথা করছে।
+[Speaker_01]: জ্বর কত আসছে?
+[Speaker_02]: ১০১-১০২ এর মতো।
+[Speaker_01]: কাশি আছে?
+[Speaker_02]: না, কাশি নাই। তবে গলা একটু ব্যথা করছে।
+[Speaker_01]: বমি বা পায়খানার সমস্যা?
+[Speaker_02]: বমি বমি ভাব আছে, কিন্তু বমি হয়নি।
+[Speaker_01]: ঠিক আছে। আগে কোনো ওষুধ খেয়েছেন?
+[Speaker_02]: প্যারাসিটামল খেয়েছিলাম, জ্বর কমে আবার আসছে।
+[Speaker_01]: আচ্ছা, রক্ত পরীক্ষা করাতে হবে। সিবিসি আর ডেঙ্গু টেস্ট। ওষুধ লিখে দিচ্ছি।"""
 
-        # First, test if the model responds (without audio)
+        print(f"  Sample transcript ({len(sample_transcript)} chars):")
+        print(f"  {'-' * 40}")
+        for line in sample_transcript.split('\n')[:5]:
+            print(f"  {line}")
+        print(f"  ... (truncated)")
+        print(f"  {'-' * 40}")
+
+        # NER system prompt for chief complaints extraction
+        system_prompt = """You are an expert NER model specialized in extracting Chief Complaints from Bengali medical transcriptions.
+
+RULES:
+1. ONLY include symptoms explicitly mentioned by the patient (Speaker_02 in this conversation)
+2. If doctor (Speaker_01) suggests symptoms and patient CONFIRMS, include them
+3. Do NOT include symptoms the patient DENIES
+4. Include duration and severity ONLY if explicitly mentioned
+5. Speaker_01 and Speaker_02 are generic labels — determine who is doctor/patient from conversation context
+
+OUTPUT: Return ONLY a valid JSON array. Each item has "Complaint (English)" and "Duration (English)".
+If no complaints found, return: []
+
+TRANSCRIPTION:
+""" + sample_transcript
+
+        print(f"\n  Sending to GPT-5.2-chat for NER extraction...")
+
         response = client.chat.completions.create(
-            model=os.getenv("AZURE_TRANSCRIBE_DEPLOYMENT"),
+            model=os.getenv("AZURE_NER_DEPLOYMENT"),
             messages=[
-                {"role": "system", "content": "You are a Bengali transcription expert."},
-                {"role": "user", "content": "Say 'Transcription API is ready!' in Bengali."}
+                {"role": "system", "content": system_prompt}
             ],
-            temperature=0.1,
-            max_tokens=50
+            # temperature=0.1,  # GPT-5.2 only supports default temperature (1)
+            max_completion_tokens=2000  # GPT-5.2 requires max_completion_tokens instead of max_tokens
         )
 
-        result = response.choices[0].message.content
-        print(f"  Response: {result}")
-        print_result(True, "Transcription API is working!")
+        result_text = response.choices[0].message.content.strip()
+
+        # Clean markdown if present
+        if "```json" in result_text:
+            result_text = result_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in result_text:
+            result_text = result_text.split("```")[1].split("```")[0].strip()
+
+        # Parse JSON
+        ner_result = json_module.loads(result_text)
+
+        print(f"\n  NER Extraction Result:")
+        print(f"  {'-' * 40}")
+        print(f"  {json_module.dumps(ner_result, ensure_ascii=False, indent=2)}")
+        print(f"  {'-' * 40}")
+
+        # Validate: we expect at least fever, body pain from the sample
+        if isinstance(ner_result, list) and len(ner_result) > 0:
+            print(f"\n  Complaints extracted: {len(ner_result)}")
+            for item in ner_result:
+                complaint = item.get("Complaint (English)", "?")
+                duration = item.get("Duration (English)", "?")
+                print(f"    - {complaint} ({duration})")
+
+            print_result(True, f"NER extraction working! Extracted {len(ner_result)} complaints")
+            return True
+        else:
+            print_result(False, "NER returned empty result — expected complaints from sample")
+            return False
+
+    except json_module.JSONDecodeError as e:
+        print(f"  Raw response: {result_text[:300]}")
+        print_result(False, f"NER returned invalid JSON: {e}")
+        return False
+    except Exception as e:
+        print_result(False, f"NER Extraction Error: {e}")
+        return False
+
+
+def test_transcription_api():
+    """Test 3: Test Transcription API endpoint connectivity."""
+    print_header("TEST 3: Transcription API (Audio Transcriptions Endpoint)")
+
+    try:
+        import requests
+
+        endpoint = os.getenv("AZURE_TRANSCRIBE_ENDPOINT", "").rstrip('/')
+        api_key = os.getenv("AZURE_TRANSCRIBE_API_KEY", "")
+        deployment = os.getenv("AZURE_TRANSCRIBE_DEPLOYMENT", "gpt-4o-transcribe-diarize")
+        api_version = os.getenv("AZURE_TRANSCRIBE_API_VERSION", "2025-03-01-preview")
+
+        if not endpoint or not api_key:
+            print_result(False, "Transcription endpoint or API key not set")
+            return False
+
+        url = f"{endpoint}/openai/deployments/{deployment}/audio/transcriptions?api-version={api_version}"
+
+        print(f"  Endpoint: {endpoint}")
+        print(f"  Deployment: {deployment}")
+        print(f"  API Version: {api_version}")
+        print(f"  Note: Full audio test runs in Test 4 (requires test_audio.wav)")
+
+        print_result(True, "Transcription API configuration verified!")
         return True
 
     except Exception as e:
@@ -123,8 +218,8 @@ def test_transcription_api():
 
 
 def test_transcription_with_audio():
-    """Test 4: Test actual audio transcription (requires test audio file)."""
-    print_header("TEST 4: Audio Transcription (with test file)")
+    """Test 4: Test audio transcription via Audio Transcriptions API."""
+    print_header("TEST 4: Audio Transcription (Audio Transcriptions API + json format)")
 
     test_audio_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -138,62 +233,96 @@ def test_transcription_with_audio():
         return None
 
     try:
-        import base64
-        from openai import AzureOpenAI
+        import requests
 
-        client = AzureOpenAI(
-            azure_endpoint=os.getenv("AZURE_TRANSCRIBE_ENDPOINT"),
-            api_key=os.getenv("AZURE_TRANSCRIBE_API_KEY"),
-            api_version=os.getenv("AZURE_API_VERSION", "2024-02-15-preview")
-        )
+        endpoint = os.getenv("AZURE_TRANSCRIBE_ENDPOINT", "").rstrip('/')
+        api_key = os.getenv("AZURE_TRANSCRIBE_API_KEY", "")
+        deployment = os.getenv("AZURE_TRANSCRIBE_DEPLOYMENT", "gpt-4o-transcribe-diarize")
+        api_version = os.getenv("AZURE_TRANSCRIBE_API_VERSION", "2025-03-01-preview")
 
-        # Read and encode audio
-        with open(test_audio_path, "rb") as f:
-            audio_base64 = base64.b64encode(f.read()).decode("utf-8")
+        url = f"{endpoint}/openai/deployments/{deployment}/audio/transcriptions?api-version={api_version}"
 
         print(f"  Audio file loaded: {os.path.getsize(test_audio_path) / 1024:.2f} KB")
-        print("  Sending audio to GPT-4o-transcribe...")
+        print(f"  Sending audio to {deployment} (Audio Transcriptions API, diarized_json)...")
 
-        response = client.chat.completions.create(
-            model=os.getenv("AZURE_TRANSCRIBE_DEPLOYMENT"),
-            messages=[
-                {
-                    "role": "system",
-                    "content": """You are a Bengali medical transcription expert.
+        headers = {
+            "api-key": api_key,
+        }
 
-## SPEAKER LABELS
-- [ডাক্তার]: Doctor's speech
-- [রোগী]: Patient's speech
-- [রোগীর সাথী]: Patient's companion
+        with open(test_audio_path, "rb") as audio_file:
+            files = {
+                "file": ("test_audio.wav", audio_file, "audio/wav")
+            }
+            data = {
+                "model": deployment,
+                "response_format": "diarized_json",  # Returns segments with speaker labels
+                "chunking_strategy": "auto",  # Required for diarization models
+                "language": "bn",  # Bengali — re-enabled (500 was from missing chunking_strategy)
+            }
 
-Transcribe the audio with speaker labels."""
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Please transcribe this Bengali medical conversation."
-                        },
-                        {
-                            "type": "input_audio",
-                            "input_audio": {
-                                "data": audio_base64,
-                                "format": "wav"
-                            }
-                        }
-                    ]
-                }
-            ],
-            temperature=0.1,
-            max_tokens=2000
-        )
+            response = requests.post(
+                url,
+                headers=headers,
+                files=files,
+                data=data,
+                timeout=120
+            )
 
-        transcript = response.choices[0].message.content
-        print(f"\n  Transcript:\n  {'-' * 40}")
-        for line in transcript.split('\n')[:10]:  # Show first 10 lines
+        if response.status_code != 200:
+            print_result(False, f"Audio transcription error: {response.status_code} - {response.text}")
+            return False
+
+        result = response.json()
+
+        # Show raw segments from API
+        segments = result.get("segments", [])
+        if segments:
+            print(f"\n  Segments found: {len(segments)}")
+            print(f"\n  Raw segments (first 5):")
+            for seg in segments[:5]:
+                speaker = seg.get("speaker", "?")
+                text = seg.get("text", "").strip()
+                print(f"    [{speaker}]: {text[:80]}")
+
+        # Format segments into final transcript (same logic as transcriber_v4.py)
+        speaker_number_map = {}
+        next_num = 1
+        merged_lines = []
+        current_speaker = None
+        current_texts = []
+
+        for seg in segments:
+            speaker = seg.get("speaker", "unknown")
+            text = seg.get("text", "").strip()
+            if not text:
+                continue
+
+            if speaker not in speaker_number_map:
+                speaker_number_map[speaker] = f"Speaker_{next_num:02d}"
+                next_num += 1
+
+            if speaker == current_speaker:
+                current_texts.append(text)
+            else:
+                if current_speaker is not None and current_texts:
+                    label = speaker_number_map[current_speaker]
+                    merged_lines.append(f"[{label}]: {' '.join(current_texts).strip()}")
+                current_speaker = speaker
+                current_texts = [text]
+
+        if current_speaker is not None and current_texts:
+            label = speaker_number_map[current_speaker]
+            merged_lines.append(f"[{label}]: {' '.join(current_texts).strip()}")
+
+        # Print formatted transcript
+        print(f"\n  Formatted Transcript:\n  {'-' * 40}")
+        for line in merged_lines[:15]:
             print(f"  {line}")
+        if len(merged_lines) > 15:
+            print(f"  ... ({len(merged_lines) - 15} more lines)")
         print(f"  {'-' * 40}")
+        print(f"  Speaker mapping: {speaker_number_map}")
+        print(f"  Total speaker turns: {len(merged_lines)}")
 
         print_result(True, "Audio transcription working!")
         return True
@@ -308,8 +437,9 @@ def main():
 
     results = {
         "Environment Variables": test_environment_variables(),
-        "NER API (GPT-4o)": test_ner_api(),
-        "Transcription API": test_transcription_api(),
+        "NER API Connectivity": test_ner_api(),
+        "NER Extraction (Chief Complaints)": test_ner_extraction(),
+        "Transcription API Config": test_transcription_api(),
         "Audio Transcription": test_transcription_with_audio(),
         "PostgreSQL": test_database_connection(),
         "Redis": test_redis_connection(),

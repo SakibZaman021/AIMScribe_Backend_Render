@@ -13,4 +13,4 @@ echo Starting Worker (listening for jobs)...
 echo Press Ctrl+C to stop
 echo.
 
-python src/worker.py
+python src/worker_async.py

@@ -11,7 +11,7 @@ from flask import Flask, request, jsonify
 from config import settings
 from database.postgres import PostgreSQLDatabase
 from storage.minio_client import get_minio_client, MinIOClient
-from queue.redis_client import get_redis_client, push_transcription_job
+from message_queue.redis_client import get_redis_client, push_transcription_job
 from prompts.loader import get_prompt_loader
 
 # Initialize Flask

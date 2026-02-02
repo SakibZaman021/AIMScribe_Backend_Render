@@ -13,11 +13,11 @@ import traceback
 # Add src to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from queue.redis_client import get_redis_client, TRANSCRIPTION_QUEUE, DEAD_LETTER_QUEUE
+from message_queue.redis_client import get_redis_client, TRANSCRIPTION_QUEUE, DEAD_LETTER_QUEUE
 from storage.minio_client import get_minio_client
 from database.postgres import PostgreSQLDatabase
 from config import settings
-from processing.transcriber_v2 import TranscriberV2
+from processing.transcriber_v4 import TranscriberV4
 from processing.ner_extractor import NERExtractor
 
 # Check for ptvsd for debugging (optional)
@@ -59,8 +59,8 @@ class AIMScribeWorker:
         )
         
         # Processing Modules
-        # Using GPT-4o-transcribe for Bengali audio with speaker labeling
-        self.transcriber = TranscriberV2()
+        # Using GPT-4o-transcribe-diarize via Audio Transcriptions API
+        self.transcriber = TranscriberV4()
         self.ner_extractor = NERExtractor()
         
         # State

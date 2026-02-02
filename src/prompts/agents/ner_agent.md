@@ -19,7 +19,7 @@ Clinical information extracted in structured JSON format following the exact sch
 You must extract the following entities:
 
 1. **Chief Complaints** - Patient-confirmed symptoms with duration/severity
-2. **Examination (O/E)** - Blood Pressure, Pulse, Temperature, Others
+2. **Examination (O/E)** - ANEMIA, DEHYDRATION, JUANDICE
 3. **Examination (S/E)** - Heart, Lung, Abdomen findings
 4. **Drug History** - Previous/self-medications by patient
 5. **Investigations** - Tests ordered by doctor
@@ -92,10 +92,9 @@ You must extract the following entities:
   ],
   "Examination (English)": {
     "O/E (English)": {
-      "Blood Pressure (English)": "",
-      "Pulse Rate (English)": "",
-      "Temperature (English)": "",
-      "Others (English)": ""
+      "ANEMIA (English)": "",
+      "DEHYDRATION (English)": "",
+      "JUANDICE (English)": ""
     },
     "S/E (English)": {
       "Heart (English)": "",

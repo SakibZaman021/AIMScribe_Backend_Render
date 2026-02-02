@@ -9,8 +9,8 @@ if exist venv\Scripts\activate.bat (
     call venv\Scripts\activate.bat
 )
 
-echo Starting Flask API Server on port 6000...
+echo Starting FastAPI Server on port 6000...
 echo Press Ctrl+C to stop
 echo.
 
-python src/main.py
+python src/main_fastapi.py
