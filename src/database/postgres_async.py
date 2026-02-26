@@ -71,6 +71,10 @@ class AsyncPostgreSQLDatabase:
                     status VARCHAR(20) DEFAULT 'active',
                     total_clips INTEGER DEFAULT 0,
                     total_duration_seconds DECIMAL(10,2) DEFAULT 0,
+                    health_screening JSONB,
+                    recording_date DATE,
+                    start_time TIME,
+                    end_time TIME,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     completed_at TIMESTAMP WITH TIME ZONE
@@ -110,6 +114,7 @@ class AsyncPostgreSQLDatabase:
                 CREATE TABLE IF NOT EXISTS ner_results (
                     id SERIAL PRIMARY KEY,
                     session_id UUID REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    patient_id VARCHAR(100),
                     version INTEGER NOT NULL,
                     patient_name TEXT,
                     age TEXT,
@@ -151,6 +156,7 @@ class AsyncPostgreSQLDatabase:
                 CREATE TABLE IF NOT EXISTS prescription_data (
                     id SERIAL PRIMARY KEY,
                     session_id UUID REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    patient_id VARCHAR(100),
                     doctor_id VARCHAR(100) NOT NULL,
                     patient_name TEXT,
                     age TEXT,
@@ -232,14 +238,21 @@ class AsyncPostgreSQLDatabase:
 
     # ========== Session Operations ==========
 
-    async def create_session(self, patient_id: str, doctor_id: str, hospital_id: str) -> str:
-        """Create a new recording session."""
+    async def create_session(
+        self,
+        patient_id: str,
+        doctor_id: str,
+        hospital_id: str,
+        health_screening: dict = None
+    ) -> str:
+        """Create a new recording session with optional health screening data."""
         session_id = str(uuid.uuid4())
         async with self._pool.acquire() as conn:
             await conn.execute('''
-                INSERT INTO sessions (session_id, patient_id, doctor_id, hospital_id)
-                VALUES ($1, $2, $3, $4)
-            ''', session_id, patient_id, doctor_id, hospital_id)
+                INSERT INTO sessions (session_id, patient_id, doctor_id, hospital_id, health_screening)
+                VALUES ($1, $2, $3, $4, $5)
+            ''', session_id, patient_id, doctor_id, hospital_id,
+                json.dumps(health_screening) if health_screening else None)
         return session_id
 
     async def get_session(self, session_id: str) -> Optional[Dict]:
@@ -249,7 +262,16 @@ class AsyncPostgreSQLDatabase:
                 'SELECT * FROM sessions WHERE session_id = $1',
                 session_id
             )
-            return dict(row) if row else None
+            if row:
+                result = dict(row)
+                # Parse health_screening JSONB
+                if isinstance(result.get('health_screening'), str):
+                    try:
+                        result['health_screening'] = json.loads(result['health_screening'])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                return result
+            return None
 
     async def finalize_session(self, session_id: str):
         """Mark session as completed."""
@@ -368,20 +390,27 @@ class AsyncPostgreSQLDatabase:
     def _decompose_ner_json(self, ner_json: dict) -> dict:
         """Extract individual fields from NER dict for column storage."""
         fields = {}
+
+        # Handle nested Patient Info structure from NER output
+        patient_info = ner_json.get('Patient Info (English)', {})
+        fields['patient_name'] = patient_info.get('Name (English)') or ner_json.get('Patient Name')
+        fields['age'] = patient_info.get('Age (English)') or ner_json.get('Age')
+        fields['gender'] = patient_info.get('Gender (English)') or ner_json.get('Gender')
+
+        # Handle other fields
         for json_key, col_name in self.NER_FIELD_MAP.items():
-            value = ner_json.get(json_key)
             if col_name in ('patient_name', 'age', 'gender'):
-                # Scalar text fields
-                fields[col_name] = str(value) if value is not None else None
-            else:
-                # JSONB fields - store as JSON string for asyncpg
-                fields[col_name] = json.dumps(value) if value is not None else None
+                continue  # Already handled above
+            value = ner_json.get(json_key)
+            # JSONB fields - store as JSON string for asyncpg
+            fields[col_name] = json.dumps(value) if value is not None else None
         return fields
 
     async def save_ner_result(
         self,
         session_id: str,
         ner_json: dict,
+        patient_id: str = None,
         is_final: bool = False,
         method: str = 'langchain_agent',
         prompt_version: str = '1.0.0'
@@ -397,17 +426,17 @@ class AsyncPostgreSQLDatabase:
 
             result_id = await conn.fetchval('''
                 INSERT INTO ner_results (
-                    session_id, version,
+                    session_id, patient_id, version,
                     patient_name, age, gender,
                     chief_complaints, drug_history, on_examination,
                     systemic_examination, additional_notes, investigations,
                     diagnosis, medications, advice, follow_up, health_screening,
                     full_ner_json, is_final, extraction_method, prompt_version
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
                 RETURNING id
             ''',
-                session_id, version,
+                session_id, patient_id, version,
                 fields['patient_name'], fields['age'], fields['gender'],
                 fields['chief_complaints'], fields['drug_history'], fields['on_examination'],
                 fields['systemic_examination'], fields['additional_notes'], fields['investigations'],
@@ -488,6 +517,7 @@ class AsyncPostgreSQLDatabase:
     async def save_prescription(
         self,
         session_id: str,
+        patient_id: str,
         doctor_id: str,
         prescription: dict
     ) -> int:
@@ -497,16 +527,16 @@ class AsyncPostgreSQLDatabase:
         async with self._pool.acquire() as conn:
             result_id = await conn.fetchval('''
                 INSERT INTO prescription_data (
-                    session_id, doctor_id,
+                    session_id, patient_id, doctor_id,
                     patient_name, age, gender,
                     chief_complaints, drug_history, on_examination,
                     systemic_examination, additional_notes, investigations,
                     diagnosis, medications, advice, follow_up, health_screening
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
                 RETURNING id
             ''',
-                session_id, doctor_id,
+                session_id, patient_id, doctor_id,
                 fields['patient_name'], fields['age'], fields['gender'],
                 fields['chief_complaints'], fields['drug_history'], fields['on_examination'],
                 fields['systemic_examination'], fields['additional_notes'], fields['investigations'],

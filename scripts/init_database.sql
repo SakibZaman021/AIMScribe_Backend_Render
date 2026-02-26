@@ -14,6 +14,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     status VARCHAR(20) DEFAULT 'active',
     total_clips INTEGER DEFAULT 0,
     total_duration_seconds DECIMAL(10,2) DEFAULT 0,
+    health_screening JSONB,
+    recording_date DATE,
+    start_time TIME,
+    end_time TIME,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMP WITH TIME ZONE
@@ -53,6 +57,7 @@ CREATE TABLE IF NOT EXISTS transcripts (
 CREATE TABLE IF NOT EXISTS ner_results (
     id SERIAL PRIMARY KEY,
     session_id UUID REFERENCES sessions(session_id) ON DELETE CASCADE,
+    patient_id VARCHAR(100),
     version INTEGER NOT NULL,
     patient_name TEXT,
     age TEXT,
@@ -94,6 +99,7 @@ CREATE TABLE IF NOT EXISTS doctor_reviews (
 CREATE TABLE IF NOT EXISTS prescription_data (
     id SERIAL PRIMARY KEY,
     session_id UUID REFERENCES sessions(session_id) ON DELETE CASCADE,
+    patient_id VARCHAR(100),
     doctor_id VARCHAR(100) NOT NULL,
     patient_name TEXT,
     age TEXT,

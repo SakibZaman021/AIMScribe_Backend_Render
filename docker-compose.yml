@@ -1,13 +1,14 @@
-# version: '3.8'
-
 # ================================================================
-# AIMScribe Backend - Docker Compose
-# Starts PostgreSQL, Redis, and MinIO services
+# AIMScribe Backend - Docker Compose (Full Stack)
+# ================================================================
+# Runs ALL services: PostgreSQL, Redis, MinIO, API Server, Worker
 # ================================================================
 # Usage:
-#   docker-compose up -d      (Start all services)
-#   docker-compose down       (Stop all services)
-#   docker-compose logs -f    (View logs)
+#   docker-compose up -d              (Start all services)
+#   docker-compose up -d --build      (Rebuild and start)
+#   docker-compose down               (Stop all services)
+#   docker-compose logs -f api worker (View API & Worker logs)
+#   docker-compose logs -f            (View all logs)
 # ================================================================
 
 services:
@@ -83,7 +84,124 @@ services:
       minio:
         condition: service_healthy
     entrypoint: >
-      /bin/sh -c " mc alias set aimscribe http://minio:9000 aimscribe aimscribe123; mc mb --ignore-existing aimscribe/aimscribe-audio; mc anonymous set download aimscribe/aimscribe-audio; echo 'Bucket created successfully'; exit 0; "
+      /bin/sh -c "
+      mc alias set aimscribe http://minio:9000 aimscribe aimscribe123;
+      mc mb --ignore-existing aimscribe/aimscribe-audio;
+      mc anonymous set download aimscribe/aimscribe-audio;
+      echo 'Bucket created successfully';
+      exit 0;
+      "
+
+  # ================================================================
+  # API Server (FastAPI)
+  # ================================================================
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: aimscribe-api
+    ports:
+      - "6000:6000"
+    environment:
+      # Azure OpenAI - Transcription
+      AZURE_TRANSCRIBE_ENDPOINT: ${AZURE_TRANSCRIBE_ENDPOINT}
+      AZURE_TRANSCRIBE_API_KEY: ${AZURE_TRANSCRIBE_API_KEY}
+      AZURE_TRANSCRIBE_DEPLOYMENT: ${AZURE_TRANSCRIBE_DEPLOYMENT:-gpt-4o-transcribe-diarize}
+      AZURE_TRANSCRIBE_API_VERSION: ${AZURE_TRANSCRIBE_API_VERSION:-2025-03-01-preview}
+      # Azure OpenAI - NER
+      AZURE_NER_ENDPOINT: ${AZURE_NER_ENDPOINT}
+      AZURE_NER_API_KEY: ${AZURE_NER_API_KEY}
+      AZURE_NER_DEPLOYMENT: ${AZURE_NER_DEPLOYMENT:-gpt-5.2-chat}
+      AZURE_API_VERSION: ${AZURE_API_VERSION:-2025-01-01-preview}
+      # PostgreSQL (container hostname)
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: aimscribe_db
+      POSTGRES_USER: aimscribe_user
+      POSTGRES_PASSWORD: aimscribe123
+      POSTGRES_POOL_MIN: 5
+      POSTGRES_POOL_MAX: 20
+      # Redis (container hostname)
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      # MinIO (container hostname)
+      MINIO_ENDPOINT: minio:9000
+      MINIO_EXTERNAL_ENDPOINT: localhost:9000
+      MINIO_ACCESS_KEY: aimscribe
+      MINIO_SECRET_KEY: aimscribe123
+      MINIO_BUCKET: aimscribe-audio
+      MINIO_SECURE: "false"
+      # Server
+      SERVER_PORT: 6000
+      SERVER_HOST: 0.0.0.0
+      LOG_LEVEL: INFO
+      PROMPTS_DIR: /app/src/prompts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:6000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # ================================================================
+  # Worker (Async Transcription & NER Processing)
+  # ================================================================
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: aimscribe-worker
+    environment:
+      # Azure OpenAI - Transcription
+      AZURE_TRANSCRIBE_ENDPOINT: ${AZURE_TRANSCRIBE_ENDPOINT}
+      AZURE_TRANSCRIBE_API_KEY: ${AZURE_TRANSCRIBE_API_KEY}
+      AZURE_TRANSCRIBE_DEPLOYMENT: ${AZURE_TRANSCRIBE_DEPLOYMENT:-gpt-4o-transcribe-diarize}
+      AZURE_TRANSCRIBE_API_VERSION: ${AZURE_TRANSCRIBE_API_VERSION:-2025-03-01-preview}
+      # Azure OpenAI - NER
+      AZURE_NER_ENDPOINT: ${AZURE_NER_ENDPOINT}
+      AZURE_NER_API_KEY: ${AZURE_NER_API_KEY}
+      AZURE_NER_DEPLOYMENT: ${AZURE_NER_DEPLOYMENT:-gpt-5.2-chat}
+      AZURE_API_VERSION: ${AZURE_API_VERSION:-2025-01-01-preview}
+      # PostgreSQL (container hostname)
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: aimscribe_db
+      POSTGRES_USER: aimscribe_user
+      POSTGRES_PASSWORD: aimscribe123
+      POSTGRES_POOL_MIN: 5
+      POSTGRES_POOL_MAX: 20
+      # Redis (container hostname)
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      # MinIO (container hostname)
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: aimscribe
+      MINIO_SECRET_KEY: aimscribe123
+      MINIO_BUCKET: aimscribe-audio
+      MINIO_SECURE: "false"
+      # Worker Config
+      LOG_LEVEL: INFO
+      PROMPTS_DIR: /app/src/prompts
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-10}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres_data:

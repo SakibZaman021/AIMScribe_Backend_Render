@@ -226,8 +226,7 @@ class NERExtractor:
         """Initialize empty JSON structure with patient demographics."""
         ctx = ctx or {}
         demographics = ctx.get('demographics', {})
-        screening = ctx.get('health_screening', {})
-        
+
         return {
             "Patient Info (English)": {
                 "Name (English)": demographics.get('name', ''),
@@ -235,15 +234,15 @@ class NERExtractor:
                 "Gender (English)": demographics.get('gender', ''),
                 "Blood Group (English)": demographics.get('blood_group', ''),
                 "Last Visit Date (English)": ctx.get('last_visit_date', ''),
-                "Consultation Date (English)": "" 
+                "Consultation Date (English)": ""
             },
             "Chief Complaints (English)": [],
             "Examination (English)": {
                 "O/E (English)": {
-                    "Blood Pressure (English)": "",
-                    "Pulse Rate (English)": "",
-                    "Temperature (English)": "",
-                    "Others (English)": ""
+                    "ANEMIA. (English)": "",
+                    "DEHYDRATION. (English)": "",
+                    "JAUNDICE. (English)": "",
+                    "EDEMA. (English)": ""
                 },
                 "S/E (English)": {
                     "Heart (English)": "",

@@ -234,8 +234,17 @@ class AsyncAIMScribeWorker:
             prev_meds['medications'] if prev_meds else None
         )
 
-        # Save Result (async)
-        await self.db.save_ner_result(session_id, ner_result, is_final=is_final)
+        # Merge session's health_screening (client input) into NER result
+        if session.get('health_screening'):
+            ner_result['Health Screening'] = session['health_screening']
+
+        # Save Result (async) - include patient_id
+        await self.db.save_ner_result(
+            session_id=session_id,
+            ner_json=ner_result,
+            patient_id=patient_id,
+            is_final=is_final
+        )
 
         # If final, archive and invalidate caches (async)
         if is_final:

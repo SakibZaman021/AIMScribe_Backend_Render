@@ -1,5 +1,5 @@
 # ================================================================
-# AIMScribe AI Backend - Production Dockerfile
+# AIMScribe AI Backend - API Server Dockerfile
 # ================================================================
 # Multi-stage build for optimized production image
 
@@ -61,5 +61,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 # Expose port
 EXPOSE 6000
 
-# Run the application
-CMD ["python", "-m", "src.main"]
+# Run the FastAPI application
+CMD ["python", "src/main_fastapi.py"]

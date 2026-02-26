@@ -99,6 +99,10 @@ class Settings(BaseSettings):
     # MinIO Configuration
     # ================================================================
     minio_endpoint: str = Field(default="minio:9000")
+    minio_external_endpoint: str = Field(
+        default="localhost:9000",
+        description="External MinIO endpoint for presigned URLs (accessible from clients)"
+    )
     minio_access_key: str = Field(default="aimscribe")
     minio_secret_key: str = Field(default="aimscribe123")
     minio_bucket: str = Field(default="aimscribe-audio")

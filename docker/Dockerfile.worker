@@ -45,5 +45,5 @@ ENV PYTHONPATH=/app \
     PROMPTS_DIR=/app/src/prompts \
     LOG_LEVEL=INFO
 
-# Worker entry point
-CMD ["python", "-m", "src.worker"]
+# Async Worker entry point
+CMD ["python", "src/worker_async.py"]

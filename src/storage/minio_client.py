@@ -18,44 +18,62 @@ logger = logging.getLogger(__name__)
 class MinIOClient:
     """
     MinIO client for audio file storage.
-    
+
     Features:
     - Presigned upload URLs (for direct client upload)
     - Presigned download URLs
     - File upload/download
     - Bucket management
     """
-    
+
     def __init__(
         self,
         endpoint: str,
         access_key: str,
         secret_key: str,
         bucket: str,
-        secure: bool = False
+        secure: bool = False,
+        external_endpoint: str = None
     ):
         """
         Initialize MinIO client.
-        
+
         Args:
             endpoint: MinIO server endpoint (host:port)
             access_key: Access key (username)
             secret_key: Secret key (password)
             bucket: Default bucket name
             secure: Use HTTPS if True
+            external_endpoint: External endpoint for presigned URLs (for clients outside Docker)
         """
         self.endpoint = endpoint
+        self.external_endpoint = external_endpoint or endpoint
         self.bucket = bucket
-        
+        self.secure = secure
+
+        # Internal client for operations (uploads, downloads, bucket checks)
         self.client = Minio(
             endpoint,
             access_key=access_key,
             secret_key=secret_key,
             secure=secure
         )
-        
+
+        # External client for presigned URLs only
+        # Uses fixed region to avoid network calls to unreachable external endpoint
+        if external_endpoint and external_endpoint != endpoint:
+            self.presign_client = Minio(
+                external_endpoint,
+                access_key=access_key,
+                secret_key=secret_key,
+                secure=secure,
+                region="us-east-1"  # Fixed region to skip server query
+            )
+        else:
+            self.presign_client = self.client
+
         self._ensure_bucket_exists()
-        logger.info(f"MinIO client initialized: {endpoint}/{bucket}")
+        logger.info(f"MinIO client initialized: {endpoint}/{bucket} (external: {self.external_endpoint})")
     
     def _ensure_bucket_exists(self):
         """Create bucket if it doesn't exist."""
@@ -74,16 +92,17 @@ class MinIOClient:
     ) -> str:
         """
         Generate a presigned URL for uploading.
-        
+
         Args:
             object_name: Object path (e.g., "audio/session123/clip_1.wav")
             expires: URL expiry in seconds (default: 5 minutes)
-            
+
         Returns:
             Presigned URL for PUT request
         """
         try:
-            url = self.client.presigned_put_object(
+            # Use presign_client for external URLs (signature includes host)
+            url = self.presign_client.presigned_put_object(
                 self.bucket,
                 object_name,
                 expires=timedelta(seconds=expires)
@@ -101,16 +120,17 @@ class MinIOClient:
     ) -> str:
         """
         Generate a presigned URL for downloading.
-        
+
         Args:
             object_name: Object path
             expires: URL expiry in seconds (default: 1 hour)
-            
+
         Returns:
             Presigned URL for GET request
         """
         try:
-            url = self.client.presigned_get_object(
+            # Use presign_client for external URLs (signature includes host)
+            url = self.presign_client.presigned_get_object(
                 self.bucket,
                 object_name,
                 expires=timedelta(seconds=expires)
@@ -298,16 +318,17 @@ _minio_client: Optional[MinIOClient] = None
 def get_minio_client() -> MinIOClient:
     """Get or create the MinIO client singleton."""
     global _minio_client
-    
+
     if _minio_client is None:
         from config import settings
-        
+
         _minio_client = MinIOClient(
             endpoint=settings.minio_endpoint,
             access_key=settings.minio_access_key,
             secret_key=settings.minio_secret_key,
             bucket=settings.minio_bucket,
-            secure=settings.minio_secure
+            secure=settings.minio_secure,
+            external_endpoint=settings.minio_external_endpoint
         )
-    
+
     return _minio_client

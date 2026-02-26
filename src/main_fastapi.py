@@ -29,10 +29,25 @@ logger = logging.getLogger(__name__)
 # Pydantic Models (Request/Response)
 # ============================================================================
 
+class HealthScreeningInput(BaseModel):
+    bp_systolic: str = None
+    bp_diastolic: str = None
+    diabetes_fasting: str = None
+    diabetes_random: str = None
+    height_cm: str = None
+    weight_kg: str = None
+    temperature: str = None
+    pulse_rate: str = None
+
+
 class SessionCreateRequest(BaseModel):
     patient_id: str
+    patient_name: str = None
+    age: str = None
+    gender: str = None
     doctor_id: str = "DR_DEFAULT"
     hospital_id: str = "HOSP_DEFAULT"
+    health_screening: HealthScreeningInput = None
 
 
 class SessionCreateResponse(BaseModel):
@@ -193,24 +208,29 @@ async def health():
 
 @app.post("/api/v1/session/create", response_model=SessionCreateResponse)
 async def create_session(request: SessionCreateRequest):
-    """Create a new recording session."""
+    """Create a new recording session with patient demographics and health screening."""
     try:
-        # Create session (async)
+        # Convert health_screening to dict if provided
+        health_screening_dict = None
+        if request.health_screening:
+            health_screening_dict = request.health_screening.model_dump(exclude_none=True)
+
+        # Create session with health screening (async)
         session_id = await ctx.db.create_session(
             request.patient_id,
             request.doctor_id,
-            request.hospital_id
+            request.hospital_id,
+            health_screening=health_screening_dict
         )
 
-        # Ensure patient exists (async)
-        baseline = await ctx.db.get_patient_baseline(request.patient_id)
-        if not baseline['demographics'].get('name'):
-            await ctx.db.upsert_patient({
-                'patient_id': request.patient_id,
-                'name': 'Unknown Patient',
-                'age': 'N/A',
-                'gender': 'N/A'
-            })
+        # Upsert patient with demographics from request
+        patient_data = {
+            'patient_id': request.patient_id,
+            'name': request.patient_name or 'Unknown Patient',
+            'age': request.age or 'N/A',
+            'gender': request.gender or 'N/A'
+        }
+        await ctx.db.upsert_patient(patient_data)
 
         return SessionCreateResponse(
             session_id=session_id,
@@ -418,12 +438,20 @@ async def get_doctor_reviews(session_id: str):
 async def save_prescription(request: PrescriptionRequest):
     """Save final prescription data (doctor presses Print)."""
     try:
+        # Get patient_id from session
+        session = await ctx.db.get_session(request.session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
         prescription_id = await ctx.db.save_prescription(
             session_id=request.session_id,
+            patient_id=session['patient_id'],
             doctor_id=request.doctor_id,
             prescription=request.prescription
         )
         return {"prescription_id": prescription_id, "status": "saved"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
