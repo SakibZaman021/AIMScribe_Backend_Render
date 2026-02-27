@@ -5,6 +5,7 @@ Uses asyncio for true parallel processing of jobs.
 
 import os
 import sys
+import json
 import asyncio
 import logging
 import traceback
@@ -36,7 +37,22 @@ class AsyncAIMScribeWorker:
     - True async I/O for database and Redis
     - Parallel NER extraction (ThreadPoolExecutor for LLM calls)
     - Non-blocking job processing
+    - Smart NER versioning (only saves when meaningful changes detected)
     """
+
+    # Fields to compare for meaningful NER changes
+    NER_COMPARE_FIELDS = [
+        'chief_complaints',
+        'diagnosis',
+        'medications',
+        'advice',
+        'follow_up',
+        'investigations',
+        'on_examination',
+        'drug_history',
+        'systemic_examination',
+        'additional_notes'
+    ]
 
     def __init__(self):
         logger.info("Initializing Async AIMScribe Worker...")
@@ -192,6 +208,66 @@ class AsyncAIMScribeWorker:
                 except OSError as cleanup_error:
                     logger.warning(f"Failed to cleanup temp file {temp_file}: {cleanup_error}")
 
+    def _has_meaningful_changes(self, previous_ner: dict, new_ner: dict) -> tuple[bool, list]:
+        """
+        Compare two NER results to detect meaningful changes.
+
+        Args:
+            previous_ner: Previous NER result (dict with individual fields)
+            new_ner: New NER result (raw extraction output)
+
+        Returns:
+            Tuple of (has_changes: bool, changed_fields: list)
+        """
+        if previous_ner is None:
+            return True, ['first_extraction']
+
+        changed_fields = []
+
+        # Map NER output keys to database column names
+        field_mapping = {
+            'chief_complaints': 'Chief Complaints',
+            'diagnosis': 'Diagnosis',
+            'medications': 'Medications',
+            'advice': 'Advice',
+            'follow_up': 'Follow-up',
+            'investigations': 'Investigations',
+            'on_examination': 'O/E',
+            'drug_history': 'Drug History',
+            'systemic_examination': 'Systemic Examination',
+            'additional_notes': 'Additional Notes'
+        }
+
+        for db_field, ner_key in field_mapping.items():
+            # Get previous value (from database - already parsed)
+            prev_value = previous_ner.get(db_field)
+
+            # Get new value (from NER extraction - might be nested)
+            new_value = new_ner.get(ner_key)
+
+            # Normalize for comparison (handle None, empty lists, empty dicts)
+            prev_normalized = self._normalize_for_comparison(prev_value)
+            new_normalized = self._normalize_for_comparison(new_value)
+
+            if prev_normalized != new_normalized:
+                changed_fields.append(db_field)
+
+        has_changes = len(changed_fields) > 0
+        return has_changes, changed_fields
+
+    def _normalize_for_comparison(self, value):
+        """Normalize a value for comparison (handle None, empty containers)."""
+        if value is None:
+            return None
+        if isinstance(value, str) and value.strip() == '':
+            return None
+        if isinstance(value, (list, dict)) and len(value) == 0:
+            return None
+        # Convert to string for deep comparison (handles nested structures)
+        if isinstance(value, (list, dict)):
+            return json.dumps(value, sort_keys=True, ensure_ascii=False)
+        return value
+
     async def _run_ner_extraction(self, session_id: str, is_final: bool):
         """Run NER extraction with async database operations."""
         import time
@@ -238,13 +314,28 @@ class AsyncAIMScribeWorker:
         if session.get('health_screening'):
             ner_result['Health Screening'] = session['health_screening']
 
-        # Save Result (async) - include patient_id
-        await self.db.save_ner_result(
-            session_id=session_id,
-            ner_json=ner_result,
-            patient_id=patient_id,
-            is_final=is_final
-        )
+        # Fetch previous NER version for comparison
+        previous_ner = await self.db.get_latest_ner(session_id)
+
+        # Compare new NER with previous version
+        has_changes, changed_fields = self._has_meaningful_changes(previous_ner, ner_result)
+
+        # Decision: Save only if meaningful changes OR is_final
+        if has_changes or is_final:
+            if has_changes:
+                logger.info(f"NER changes detected in fields: {changed_fields}")
+            else:
+                logger.info("No NER changes, but saving as final version")
+
+            # Save Result (async) - include patient_id
+            await self.db.save_ner_result(
+                session_id=session_id,
+                ner_json=ner_result,
+                patient_id=patient_id,
+                is_final=is_final
+            )
+        else:
+            logger.info(f"NER unchanged for session {session_id}, skipping save (version stays at {previous_ner.get('version', 0) if previous_ner else 0})")
 
         # If final, archive and invalidate caches (async)
         if is_final:
