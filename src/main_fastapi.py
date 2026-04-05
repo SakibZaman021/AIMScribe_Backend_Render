@@ -48,6 +48,9 @@ class SessionCreateRequest(BaseModel):
     doctor_id: str = "DR_DEFAULT"
     hospital_id: str = "HOSP_DEFAULT"
     health_screening: HealthScreeningInput = None
+    # Webhook URLs for CMED integration
+    ner_webhook_url: str = None
+    status_webhook_url: str = None
 
 
 class SessionCreateResponse(BaseModel):
@@ -116,7 +119,8 @@ class AsyncAppContext:
             user=settings.postgres_user,
             password=settings.postgres_password,
             min_connections=settings.postgres_pool_min,
-            max_connections=settings.postgres_pool_max
+            max_connections=settings.postgres_pool_max,
+            sslmode=settings.postgres_sslmode
         )
         await self.db.initialize()
 
@@ -215,12 +219,14 @@ async def create_session(request: SessionCreateRequest):
         if request.health_screening:
             health_screening_dict = request.health_screening.model_dump(exclude_none=True)
 
-        # Create session with health screening (async)
+        # Create session with health screening and webhook URLs (async)
         session_id = await ctx.db.create_session(
             request.patient_id,
             request.doctor_id,
             request.hospital_id,
-            health_screening=health_screening_dict
+            health_screening=health_screening_dict,
+            ner_webhook_url=request.ner_webhook_url,
+            status_webhook_url=request.status_webhook_url
         )
 
         # Upsert patient with demographics from request

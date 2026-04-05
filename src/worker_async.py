@@ -9,6 +9,7 @@ import json
 import asyncio
 import logging
 import traceback
+import tempfile
 from typing import Optional
 
 # Add src to path
@@ -20,6 +21,7 @@ from database.postgres_async import AsyncPostgreSQLDatabase
 from config import settings
 from processing.transcriber_v4 import TranscriberV4
 from processing.ner_extractor import NERExtractor
+from webhooks.cmed_webhook import send_ner_webhook
 
 # Configure Logging
 logging.basicConfig(
@@ -82,7 +84,8 @@ class AsyncAIMScribeWorker:
             user=settings.postgres_user,
             password=settings.postgres_password,
             min_connections=settings.postgres_pool_min,
-            max_connections=settings.postgres_pool_max
+            max_connections=settings.postgres_pool_max,
+            sslmode=settings.postgres_sslmode
         )
         await self.db.initialize()
 
@@ -139,8 +142,9 @@ class AsyncAIMScribeWorker:
         clip_number = job.get('clip_number')
         object_key = job.get('object_key')
 
-        # Temp file path
-        temp_file = f"/tmp/{session_id}_{clip_number}.wav"
+        # Temp file path (cross-platform)
+        temp_dir = tempfile.gettempdir()
+        temp_file = os.path.join(temp_dir, f"{session_id}_{clip_number}.wav")
 
         logger.info(f"Processing job {job_id} (Session: {session_id}, Clip: {clip_number})")
 
@@ -334,6 +338,30 @@ class AsyncAIMScribeWorker:
                 patient_id=patient_id,
                 is_final=is_final
             )
+
+            # Get NER version for webhook
+            saved_ner = await self.db.get_latest_ner(session_id)
+            ner_version = saved_ner.get('version', 1) if saved_ner else 1
+
+            # Send webhook to CMED if configured
+            webhook_url = session.get('ner_webhook_url')
+            if webhook_url:
+                clip_count = await self.db.get_clip_count(session_id)
+                logger.info(f"Sending NER webhook to CMED: {webhook_url}")
+
+                await send_ner_webhook(
+                    webhook_url=webhook_url,
+                    session_id=session_id,
+                    patient_id=patient_id,
+                    doctor_id=session.get('doctor_id', 'AUTO'),
+                    hospital_id=session.get('hospital_id', 'AUTO'),
+                    clip_number=clip_count,
+                    total_clips=clip_count,
+                    is_final=is_final,
+                    ner_data=ner_result,
+                    version=ner_version,
+                    transcript=full_transcript if is_final else None
+                )
         else:
             logger.info(f"NER unchanged for session {session_id}, skipping save (version stays at {previous_ner.get('version', 0) if previous_ner else 0})")
 

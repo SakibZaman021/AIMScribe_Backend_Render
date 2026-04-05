@@ -1,7 +1,8 @@
 # ================================================================
 # AIMScribe Backend - Docker Compose (Full Stack)
 # ================================================================
-# Runs ALL services: PostgreSQL, Redis, MinIO, API Server, Worker
+# Runs: Redis, MinIO, API Server, Worker
+# PostgreSQL: Using Neon Cloud (https://neon.tech)
 # ================================================================
 # Usage:
 #   docker-compose up -d              (Start all services)
@@ -12,28 +13,6 @@
 # ================================================================
 
 services:
-  # ================================================================
-  # PostgreSQL Database
-  # ================================================================
-  postgres:
-    image: postgres:14
-    container_name: aimscribe-postgres
-    environment:
-      POSTGRES_DB: aimscribe_db
-      POSTGRES_USER: aimscribe_user
-      POSTGRES_PASSWORD: aimscribe123
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./scripts/init_database.sql:/docker-entrypoint-initdb.d/init.sql
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U aimscribe_user -d aimscribe_db" ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
   # ================================================================
   # Redis (Job Queue & Caching)
   # ================================================================
@@ -113,14 +92,15 @@ services:
       AZURE_NER_API_KEY: ${AZURE_NER_API_KEY}
       AZURE_NER_DEPLOYMENT: ${AZURE_NER_DEPLOYMENT:-gpt-5.2-chat}
       AZURE_API_VERSION: ${AZURE_API_VERSION:-2025-01-01-preview}
-      # PostgreSQL (container hostname)
-      POSTGRES_HOST: postgres
+      # PostgreSQL (Neon Cloud)
+      POSTGRES_HOST: ep-little-water-ad8yhxnc-pooler.c-2.us-east-1.aws.neon.tech
       POSTGRES_PORT: 5432
-      POSTGRES_DB: aimscribe_db
-      POSTGRES_USER: aimscribe_user
-      POSTGRES_PASSWORD: aimscribe123
-      POSTGRES_POOL_MIN: 5
-      POSTGRES_POOL_MAX: 20
+      POSTGRES_DB: neondb
+      POSTGRES_USER: neondb_owner
+      POSTGRES_PASSWORD: npg_4KnVurohUq8g
+      POSTGRES_SSLMODE: require
+      POSTGRES_POOL_MIN: 2
+      POSTGRES_POOL_MAX: 10
       # Redis (container hostname)
       REDIS_HOST: redis
       REDIS_PORT: 6379
@@ -138,8 +118,6 @@ services:
       LOG_LEVEL: INFO
       PROMPTS_DIR: /app/src/prompts
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
         condition: service_healthy
       minio:
@@ -170,14 +148,15 @@ services:
       AZURE_NER_API_KEY: ${AZURE_NER_API_KEY}
       AZURE_NER_DEPLOYMENT: ${AZURE_NER_DEPLOYMENT:-gpt-5.2-chat}
       AZURE_API_VERSION: ${AZURE_API_VERSION:-2025-01-01-preview}
-      # PostgreSQL (container hostname)
-      POSTGRES_HOST: postgres
+      # PostgreSQL (Neon Cloud)
+      POSTGRES_HOST: ep-little-water-ad8yhxnc-pooler.c-2.us-east-1.aws.neon.tech
       POSTGRES_PORT: 5432
-      POSTGRES_DB: aimscribe_db
-      POSTGRES_USER: aimscribe_user
-      POSTGRES_PASSWORD: aimscribe123
-      POSTGRES_POOL_MIN: 5
-      POSTGRES_POOL_MAX: 20
+      POSTGRES_DB: neondb
+      POSTGRES_USER: neondb_owner
+      POSTGRES_PASSWORD: npg_4KnVurohUq8g
+      POSTGRES_SSLMODE: require
+      POSTGRES_POOL_MIN: 2
+      POSTGRES_POOL_MAX: 10
       # Redis (container hostname)
       REDIS_HOST: redis
       REDIS_PORT: 6379
@@ -193,8 +172,6 @@ services:
       PROMPTS_DIR: /app/src/prompts
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-10}
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
         condition: service_healthy
       minio:
@@ -203,9 +180,11 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ================================================================
+  # Database UI: Use Neon Console at https://console.neon.tech
+  # ================================================================
+
 volumes:
-  postgres_data:
-    driver: local
   redis_data:
     driver: local
   minio_data:

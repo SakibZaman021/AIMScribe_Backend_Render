@@ -97,7 +97,7 @@ THEN:
 | Health Screening | Database (NEVER from transcript) |
 | Chief Complaints | Transcript (patient confirmed) |
 | Examination | Transcript (doctor performed) |
-| Medications | Transcript + Historical |
+| Medications | Transcript (doctor performed)+ Historical |
 | Diagnosis | Transcript (doctor confirmed) |
 | Advice/Follow Up | Transcript (doctor instructed) |
 

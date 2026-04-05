@@ -76,14 +76,22 @@ class MinIOClient:
         logger.info(f"MinIO client initialized: {endpoint}/{bucket} (external: {self.external_endpoint})")
     
     def _ensure_bucket_exists(self):
-        """Create bucket if it doesn't exist."""
+        """Check bucket exists (for R2/S3, bucket must be pre-created in dashboard)."""
         try:
-            if not self.client.bucket_exists(self.bucket):
-                self.client.make_bucket(self.bucket)
-                logger.info(f"Created bucket: {self.bucket}")
+            if self.client.bucket_exists(self.bucket):
+                logger.info(f"Bucket exists: {self.bucket}")
+            else:
+                # Try to create (works for MinIO, may fail for R2)
+                try:
+                    self.client.make_bucket(self.bucket)
+                    logger.info(f"Created bucket: {self.bucket}")
+                except S3Error as create_error:
+                    # R2 doesn't allow bucket creation via API - that's OK if bucket exists
+                    logger.warning(f"Could not create bucket (may already exist in R2): {create_error}")
         except S3Error as e:
-            logger.error(f"Failed to create bucket: {e}")
-            raise
+            # Connection error or permission issue
+            logger.error(f"Bucket check failed: {e}")
+            # Don't raise - let operations fail later with better error messages
     
     def get_presigned_upload_url(
         self,

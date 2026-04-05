@@ -26,22 +26,28 @@ class AsyncPostgreSQLDatabase:
         user: str,
         password: str,
         min_connections: int = 2,
-        max_connections: int = 10
+        max_connections: int = 10,
+        sslmode: str = 'prefer'
     ):
         self.dsn = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
         self.min_connections = min_connections
         self.max_connections = max_connections
+        self.sslmode = sslmode
         self._pool: Optional[Pool] = None
 
     async def initialize(self):
         """Initialize the connection pool and create tables."""
+        # Configure SSL for cloud databases (Neon, Supabase, etc.)
+        ssl_config = True if self.sslmode == 'require' else None
+
         self._pool = await asyncpg.create_pool(
             self.dsn,
             min_size=self.min_connections,
-            max_size=self.max_connections
+            max_size=self.max_connections,
+            ssl=ssl_config
         )
         await self._init_database()
-        logger.info(f"Async PostgreSQL pool initialized (min={self.min_connections}, max={self.max_connections})")
+        logger.info(f"Async PostgreSQL pool initialized (min={self.min_connections}, max={self.max_connections}, ssl={self.sslmode})")
 
     async def close(self):
         """Close the connection pool."""
@@ -75,10 +81,27 @@ class AsyncPostgreSQLDatabase:
                     recording_date DATE,
                     start_time TIME,
                     end_time TIME,
+                    ner_webhook_url TEXT,
+                    status_webhook_url TEXT,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     completed_at TIMESTAMP WITH TIME ZONE
                 )
+            ''')
+
+            # Add webhook columns if they don't exist (migration for existing DBs)
+            await conn.execute('''
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='sessions' AND column_name='ner_webhook_url') THEN
+                        ALTER TABLE sessions ADD COLUMN ner_webhook_url TEXT;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='sessions' AND column_name='status_webhook_url') THEN
+                        ALTER TABLE sessions ADD COLUMN status_webhook_url TEXT;
+                    END IF;
+                END $$;
             ''')
 
             # Clips table
@@ -243,16 +266,20 @@ class AsyncPostgreSQLDatabase:
         patient_id: str,
         doctor_id: str,
         hospital_id: str,
-        health_screening: dict = None
+        health_screening: dict = None,
+        ner_webhook_url: str = None,
+        status_webhook_url: str = None
     ) -> str:
-        """Create a new recording session with optional health screening data."""
+        """Create a new recording session with optional health screening and webhook URLs."""
         session_id = str(uuid.uuid4())
         async with self._pool.acquire() as conn:
             await conn.execute('''
-                INSERT INTO sessions (session_id, patient_id, doctor_id, hospital_id, health_screening)
-                VALUES ($1, $2, $3, $4, $5)
+                INSERT INTO sessions (session_id, patient_id, doctor_id, hospital_id, health_screening, ner_webhook_url, status_webhook_url)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
             ''', session_id, patient_id, doctor_id, hospital_id,
-                json.dumps(health_screening) if health_screening else None)
+                json.dumps(health_screening) if health_screening else None,
+                ner_webhook_url,
+                status_webhook_url)
         return session_id
 
     async def get_session(self, session_id: str) -> Optional[Dict]:
