@@ -94,7 +94,8 @@ class AsyncAIMScribeWorker:
             host=settings.redis_host,
             port=settings.redis_port,
             db=settings.redis_db,
-            password=settings.redis_password
+            password=settings.redis_password,
+            ssl=settings.redis_ssl
         )
         await self.redis.initialize()
 

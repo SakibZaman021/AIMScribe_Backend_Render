@@ -33,12 +33,14 @@ class AsyncRedisClient:
         host: str,
         port: int = 6379,
         db: int = 0,
-        password: Optional[str] = None
+        password: Optional[str] = None,
+        ssl: bool = False
     ):
         self.host = host
         self.port = port
         self.db = db
         self.password = password
+        self.ssl = ssl
         self._client: Optional[aioredis.Redis] = None
 
     async def initialize(self):
@@ -48,6 +50,7 @@ class AsyncRedisClient:
             port=self.port,
             db=self.db,
             password=self.password,
+            ssl=self.ssl,
             decode_responses=True
         )
         # Test connection

@@ -115,6 +115,7 @@ class Settings(BaseSettings):
     redis_port: int = Field(default=6379)
     redis_db: int = Field(default=0)
     redis_password: Optional[str] = Field(default=None)
+    redis_ssl: bool = Field(default=False, description="Use SSL for Redis (required for Upstash)")
 
     # ================================================================
     # Processing Configuration
