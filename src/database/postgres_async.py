@@ -397,15 +397,12 @@ class AsyncPostgreSQLDatabase:
     # ========== NER Operations ==========
 
     # Field mapping: NER JSON key -> database column name
+    # NOTE: Examination fields are NESTED under "Examination (English)"
     NER_FIELD_MAP = {
         'Patient Name': 'patient_name',
         'Age': 'age',
         'Gender': 'gender',
         'Chief Complaints (English)': 'chief_complaints',
-        'Drug History': 'drug_history',
-        'On Examination': 'on_examination',
-        'Systemic Examination': 'systemic_examination',
-        'Additional Notes': 'additional_notes',
         'Investigations (English)': 'investigations',
         'Diagnosis (English)': 'diagnosis',
         'Medications': 'medications',
@@ -424,13 +421,33 @@ class AsyncPostgreSQLDatabase:
         fields['age'] = patient_info.get('Age (English)') or ner_json.get('Age')
         fields['gender'] = patient_info.get('Gender (English)') or ner_json.get('Gender')
 
-        # Handle other fields
+        # Handle top-level fields
         for json_key, col_name in self.NER_FIELD_MAP.items():
             if col_name in ('patient_name', 'age', 'gender'):
                 continue  # Already handled above
             value = ner_json.get(json_key)
             # JSONB fields - store as JSON string for asyncpg
             fields[col_name] = json.dumps(value) if value is not None else None
+
+        # Handle NESTED Examination fields under "Examination (English)"
+        examination = ner_json.get('Examination (English)', {})
+
+        # O/E (On Examination) - physical exam findings
+        on_exam = examination.get('O/E (English)')
+        fields['on_examination'] = json.dumps(on_exam) if on_exam else None
+
+        # S/E (Systemic Examination) - organ system findings
+        sys_exam = examination.get('S/E (English)')
+        fields['systemic_examination'] = json.dumps(sys_exam) if sys_exam else None
+
+        # Drug History - nested under examination
+        drug_hist = examination.get('Drug History (English)')
+        fields['drug_history'] = json.dumps(drug_hist) if drug_hist else None
+
+        # Additional Notes - nested under examination
+        add_notes = examination.get('Additional Notes (English)')
+        fields['additional_notes'] = json.dumps(add_notes) if add_notes else None
+
         return fields
 
     async def save_ner_result(
