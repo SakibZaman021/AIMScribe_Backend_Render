@@ -67,10 +67,10 @@ class AsyncPostgreSQLDatabase:
     async def _init_database(self):
         """Initialize database tables."""
         async with self._pool.acquire() as conn:
-            # Sessions table
+            # Sessions table - session_id can be client-provided or UUID string
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS sessions (
-                    session_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    session_id VARCHAR(255) PRIMARY KEY,
                     patient_id VARCHAR(100) NOT NULL,
                     doctor_id VARCHAR(100) NOT NULL,
                     hospital_id VARCHAR(100) NOT NULL,
@@ -266,16 +266,40 @@ class AsyncPostgreSQLDatabase:
         patient_id: str,
         doctor_id: str,
         hospital_id: str,
+        session_id: str = None,
         health_screening: dict = None,
         ner_webhook_url: str = None,
         status_webhook_url: str = None
     ) -> str:
-        """Create a new recording session with optional health screening and webhook URLs."""
-        session_id = str(uuid.uuid4())
+        """
+        Create a new recording session.
+
+        Args:
+            patient_id: Patient identifier
+            doctor_id: Doctor identifier
+            hospital_id: Hospital identifier
+            session_id: Client-provided session ID (format: PatientID_DoctorID_HospitalID_YYYYMMDD)
+                       If not provided, generates UUID.
+            health_screening: Health screening data (optional)
+            ner_webhook_url: Webhook URL for NER notifications
+            status_webhook_url: Webhook URL for status updates
+        """
+        # Use client-provided session_id or generate UUID
+        if not session_id:
+            session_id = str(uuid.uuid4())
+
         async with self._pool.acquire() as conn:
             await conn.execute('''
                 INSERT INTO sessions (session_id, patient_id, doctor_id, hospital_id, health_screening, ner_webhook_url, status_webhook_url)
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (session_id) DO UPDATE SET
+                    patient_id = EXCLUDED.patient_id,
+                    doctor_id = EXCLUDED.doctor_id,
+                    hospital_id = EXCLUDED.hospital_id,
+                    health_screening = COALESCE(EXCLUDED.health_screening, sessions.health_screening),
+                    ner_webhook_url = COALESCE(EXCLUDED.ner_webhook_url, sessions.ner_webhook_url),
+                    status_webhook_url = COALESCE(EXCLUDED.status_webhook_url, sessions.status_webhook_url),
+                    updated_at = CURRENT_TIMESTAMP
             ''', session_id, patient_id, doctor_id, hospital_id,
                 json.dumps(health_screening) if health_screening else None,
                 ner_webhook_url,

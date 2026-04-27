@@ -62,30 +62,52 @@ def health():
 
 @app.route('/api/v1/session/create', methods=['POST'])
 def create_session():
-    """Create a new session."""
+    """
+    Create a new session.
+
+    Accepts client-provided session_id (format: PatientID_DoctorID_HospitalID_YYYYMMDD)
+    or generates a new UUID if not provided.
+    """
     data = request.json or {}
     patient_id = data.get('patient_id')
     doctor_id = data.get('doctor_id', 'DR_DEFAULT')
     hospital_id = data.get('hospital_id', 'HOSP_DEFAULT')
-    
+    client_session_id = data.get('session_id')  # Client-provided session ID
+
+    # Optional fields for patient info and webhooks
+    patient_name = data.get('patient_name', '')
+    patient_age = data.get('age', '')
+    patient_gender = data.get('gender', '')
+    health_screening = data.get('health_screening', {})
+    ner_webhook_url = data.get('ner_webhook_url', '')
+    status_webhook_url = data.get('status_webhook_url', '')
+
     if not patient_id:
         return jsonify({'error': 'patient_id is required'}), 400
-        
+
     try:
-        session_id = ctx.db.create_session(patient_id, doctor_id, hospital_id)
-        
-        # Ensure patient baseline exists (placeholder logic)
-        # In real app, might fetch from EHR or check patient table
-        baseline = ctx.db.get_patient_baseline(patient_id)
-        if not baseline['demographics'].get('name'):
-            # Create dummy patient if not exists
-            ctx.db.upsert_patient({
-                'patient_id': patient_id,
-                'name': 'Unknown Patient',
-                'age': 'N/A',
-                'gender': 'N/A'
-            })
-            
+        # Use client-provided session_id or generate new one
+        session_id = ctx.db.create_session(
+            patient_id,
+            doctor_id,
+            hospital_id,
+            session_id=client_session_id,
+            ner_webhook_url=ner_webhook_url,
+            status_webhook_url=status_webhook_url
+        )
+
+        # Upsert patient with provided info
+        patient_data = {
+            'patient_id': patient_id,
+            'name': patient_name or 'Unknown Patient',
+            'age': patient_age or 'N/A',
+            'gender': patient_gender or 'N/A'
+        }
+        if health_screening:
+            patient_data['health_screening'] = health_screening
+
+        ctx.db.upsert_patient(patient_data)
+
         return jsonify({
             'session_id': session_id,
             'status': 'active',

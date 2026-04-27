@@ -86,16 +86,18 @@ class PostgreSQLDatabase:
         with self.get_connection() as conn:
             with conn.cursor() as cur:
                 
-                # Sessions table
+                # Sessions table - session_id can be client-provided string or UUID
                 cur.execute('''
                     CREATE TABLE IF NOT EXISTS sessions (
-                        session_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        session_id VARCHAR(255) PRIMARY KEY,
                         patient_id VARCHAR(100) NOT NULL,
                         doctor_id VARCHAR(100) NOT NULL,
                         hospital_id VARCHAR(100) NOT NULL,
                         status VARCHAR(20) DEFAULT 'active',
                         total_clips INTEGER DEFAULT 0,
                         total_duration_seconds DECIMAL(10,2) DEFAULT 0,
+                        ner_webhook_url TEXT,
+                        status_webhook_url TEXT,
                         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                         completed_at TIMESTAMP WITH TIME ZONE
@@ -106,12 +108,13 @@ class PostgreSQLDatabase:
                 cur.execute('''
                     CREATE TABLE IF NOT EXISTS clips (
                         id SERIAL PRIMARY KEY,
-                        session_id UUID REFERENCES sessions(session_id) ON DELETE CASCADE,
+                        session_id VARCHAR(255) REFERENCES sessions(session_id) ON DELETE CASCADE,
                         clip_number INTEGER NOT NULL,
                         object_key VARCHAR(255) NOT NULL,
                         clip_transcript TEXT,
                         status VARCHAR(20) DEFAULT 'pending',
                         audio_duration_seconds DECIMAL(10,2),
+                        idempotency_key VARCHAR(64),
                         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                         transcribed_at TIMESTAMP WITH TIME ZONE,
                         error_message TEXT,
@@ -123,7 +126,7 @@ class PostgreSQLDatabase:
                 cur.execute('''
                     CREATE TABLE IF NOT EXISTS transcripts (
                         id SERIAL PRIMARY KEY,
-                        session_id UUID REFERENCES sessions(session_id) ON DELETE CASCADE,
+                        session_id VARCHAR(255) REFERENCES sessions(session_id) ON DELETE CASCADE,
                         full_transcript TEXT,
                         clip_count INTEGER NOT NULL,
                         last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -134,7 +137,7 @@ class PostgreSQLDatabase:
                 cur.execute('''
                     CREATE TABLE IF NOT EXISTS ner_results (
                         id SERIAL PRIMARY KEY,
-                        session_id UUID REFERENCES sessions(session_id) ON DELETE CASCADE,
+                        session_id VARCHAR(255) REFERENCES sessions(session_id) ON DELETE CASCADE,
                         version INTEGER NOT NULL,
                         ner_json JSONB NOT NULL,
                         is_final BOOLEAN DEFAULT FALSE,
@@ -148,7 +151,7 @@ class PostgreSQLDatabase:
                 cur.execute('''
                     CREATE TABLE IF NOT EXISTS doctor_edits (
                         id SERIAL PRIMARY KEY,
-                        session_id UUID REFERENCES sessions(session_id) ON DELETE CASCADE,
+                        session_id VARCHAR(255) REFERENCES sessions(session_id) ON DELETE CASCADE,
                         ner_version INTEGER NOT NULL,
                         field_path VARCHAR(255) NOT NULL,
                         original_value TEXT,
@@ -194,7 +197,7 @@ class PostgreSQLDatabase:
                     CREATE TABLE IF NOT EXISTS previous_visits (
                         id SERIAL PRIMARY KEY,
                         patient_id VARCHAR(100) REFERENCES patients(patient_id) ON DELETE CASCADE,
-                        session_id UUID,
+                        session_id VARCHAR(255),
                         visit_date DATE NOT NULL,
                         chief_complaints JSONB,
                         diagnosis JSONB,
@@ -229,16 +232,48 @@ class PostgreSQLDatabase:
     
     # ========== Session Operations ==========
     
-    def create_session(self, patient_id: str, doctor_id: str, hospital_id: str) -> str:
-        """Create a new recording session."""
-        session_id = str(uuid.uuid4())
+    def create_session(
+        self,
+        patient_id: str,
+        doctor_id: str,
+        hospital_id: str,
+        session_id: str = None,
+        ner_webhook_url: str = None,
+        status_webhook_url: str = None
+    ) -> str:
+        """
+        Create a new recording session.
+
+        Args:
+            patient_id: Patient identifier
+            doctor_id: Doctor identifier
+            hospital_id: Hospital identifier
+            session_id: Client-provided session ID (format: PatientID_DoctorID_HospitalID_YYYYMMDD)
+                       If not provided, generates UUID.
+            ner_webhook_url: Webhook URL for NER result notifications
+            status_webhook_url: Webhook URL for status updates
+        """
+        # Use client-provided session_id or generate UUID
+        if not session_id:
+            session_id = str(uuid.uuid4())
+
         with self.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute('''
-                    INSERT INTO sessions (session_id, patient_id, doctor_id, hospital_id)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO sessions (
+                        session_id, patient_id, doctor_id, hospital_id,
+                        ner_webhook_url, status_webhook_url
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (session_id) DO UPDATE SET
+                        patient_id = EXCLUDED.patient_id,
+                        doctor_id = EXCLUDED.doctor_id,
+                        hospital_id = EXCLUDED.hospital_id,
+                        ner_webhook_url = COALESCE(EXCLUDED.ner_webhook_url, sessions.ner_webhook_url),
+                        status_webhook_url = COALESCE(EXCLUDED.status_webhook_url, sessions.status_webhook_url),
+                        updated_at = CURRENT_TIMESTAMP
                     RETURNING session_id
-                ''', (session_id, patient_id, doctor_id, hospital_id))
+                ''', (session_id, patient_id, doctor_id, hospital_id, ner_webhook_url, status_webhook_url))
                 result = cur.fetchone()
         return str(result[0])
     
