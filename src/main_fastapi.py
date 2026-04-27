@@ -42,6 +42,7 @@ class HealthScreeningInput(BaseModel):
 
 class SessionCreateRequest(BaseModel):
     patient_id: str
+    session_id: str = None  # Client-provided session ID (PatientID_DoctorID_HospitalID_YYYYMMDD)
     patient_name: str = None
     age: str = None
     gender: str = None
@@ -221,10 +222,12 @@ async def create_session(request: SessionCreateRequest):
             health_screening_dict = request.health_screening.model_dump(exclude_none=True)
 
         # Create session with health screening and webhook URLs (async)
+        # Use client-provided session_id if available
         session_id = await ctx.db.create_session(
             request.patient_id,
             request.doctor_id,
             request.hospital_id,
+            session_id=request.session_id,  # Client-provided session ID
             health_screening=health_screening_dict,
             ner_webhook_url=request.ner_webhook_url,
             status_webhook_url=request.status_webhook_url
