@@ -100,10 +100,14 @@ async def send_ner_webhook(
         "ner": {
             "version": version,
             "chief_complaints": ner_data.get("Chief Complaints (English)", []),
-            "drug_history": ner_data.get("Drug History", []),
-            "on_examination": ner_data.get("On Examination", []),
-            "systemic_examination": ner_data.get("Systemic Examination", []),
-            "additional_notes": ner_data.get("Additional Notes", []),
+            # Drug History is nested inside Examination
+            "drug_history": ner_data.get("Examination (English)", {}).get("Drug History (English)", []),
+            # On Examination (O/E) is nested inside Examination
+            "on_examination": ner_data.get("Examination (English)", {}).get("O/E (English)", {}),
+            # Systemic Examination (S/E) is nested inside Examination
+            "systemic_examination": ner_data.get("Examination (English)", {}).get("S/E (English)", {}),
+            # Additional Notes is nested inside Examination
+            "additional_notes": ner_data.get("Examination (English)", {}).get("Additional Notes (English)", []),
             "investigations": ner_data.get("Investigations (English)", []),
             "diagnosis": ner_data.get("Diagnosis (English)", []),
             "medications": ner_data.get("Medications", []),
