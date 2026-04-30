@@ -218,8 +218,8 @@ class AsyncAIMScribeWorker:
         Compare two NER results to detect meaningful changes.
 
         Args:
-            previous_ner: Previous NER result (dict with individual fields)
-            new_ner: New NER result (raw extraction output)
+            previous_ner: Previous NER result (dict with DB column names)
+            new_ner: New NER result (raw extraction output with NER keys)
 
         Returns:
             Tuple of (has_changes: bool, changed_fields: list)
@@ -229,28 +229,41 @@ class AsyncAIMScribeWorker:
 
         changed_fields = []
 
-        # Map NER output keys to database column names
-        field_mapping = {
-            'chief_complaints': 'Chief Complaints',
-            'diagnosis': 'Diagnosis',
+        # Top-level fields: Map DB column name -> NER output key
+        top_level_mapping = {
+            'chief_complaints': 'Chief Complaints (English)',
+            'diagnosis': 'Diagnosis (English)',
             'medications': 'Medications',
-            'advice': 'Advice',
-            'follow_up': 'Follow-up',
-            'investigations': 'Investigations',
-            'on_examination': 'O/E',
-            'drug_history': 'Drug History',
-            'systemic_examination': 'Systemic Examination',
-            'additional_notes': 'Additional Notes'
+            'advice': 'Advice (Bengali)',
+            'follow_up': 'Follow Up (Bengali)',
+            'investigations': 'Investigations (English)',
         }
 
-        for db_field, ner_key in field_mapping.items():
-            # Get previous value (from database - already parsed)
-            prev_value = previous_ner.get(db_field)
+        # Nested fields under "Examination (English)": Map DB column -> nested key
+        examination_mapping = {
+            'on_examination': 'O/E (English)',           # On Examination
+            'systemic_examination': 'S/E (English)',     # Systemic Examination
+            'drug_history': 'Drug History (English)',
+            'additional_notes': 'Additional Notes (English)',
+        }
 
-            # Get new value (from NER extraction - might be nested)
+        # Compare top-level fields
+        for db_field, ner_key in top_level_mapping.items():
+            prev_value = previous_ner.get(db_field)
             new_value = new_ner.get(ner_key)
 
-            # Normalize for comparison (handle None, empty lists, empty dicts)
+            prev_normalized = self._normalize_for_comparison(prev_value)
+            new_normalized = self._normalize_for_comparison(new_value)
+
+            if prev_normalized != new_normalized:
+                changed_fields.append(db_field)
+
+        # Compare nested examination fields
+        examination = new_ner.get('Examination (English)', {})
+        for db_field, nested_key in examination_mapping.items():
+            prev_value = previous_ner.get(db_field)
+            new_value = examination.get(nested_key)
+
             prev_normalized = self._normalize_for_comparison(prev_value)
             new_normalized = self._normalize_for_comparison(new_value)
 

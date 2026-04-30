@@ -1,7 +1,14 @@
 """
 AIMScribe AI Backend - NER Extractor Module
 Handles clinical entity extraction using LangChain and COT Prompts.
-Optimized with parallel module execution using ThreadPoolExecutor.
+
+Optimized with Sequential Batching aligned to Clinical Workflow:
+  - Batch 1 (History):     chief_complaints, drug_history, additional_notes
+  - Batch 2 (Assessment):  examination, investigations, diagnosis
+  - Batch 3 (Plan):        medications, advice, follow_up
+
+This respects Azure OpenAI rate limits (3 concurrent requests per batch)
+while following the natural flow of a medical consultation.
 """
 
 import logging
@@ -19,15 +26,20 @@ from prompts.loader import PromptLoader, get_prompt_loader
 
 logger = logging.getLogger(__name__)
 
-# Maximum workers for parallel NER extraction (9 modules)
-MAX_NER_WORKERS = 9
+# Workers per batch (3 modules per batch, respects Azure rate limits)
+BATCH_WORKERS = 3
 
 
 class NERExtractor:
     """
     Extracts clinical entities using COT prompts and few-shot examples.
+
+    Uses Sequential Batching Strategy aligned with clinical workflow:
+    1. History Phase:     What patient reports (complaints, drug history, notes)
+    2. Assessment Phase:  Doctor's examination and findings
+    3. Plan Phase:        Treatment decisions (medications, advice, follow-up)
     """
-    
+
     def __init__(self):
         self.llm = AzureChatOpenAI(
             azure_endpoint=settings.azure_ner_endpoint,
@@ -38,7 +50,7 @@ class NERExtractor:
             max_completion_tokens=4000  # GPT-5.2 requires max_completion_tokens instead of max_tokens
         )
         self.prompt_loader = get_prompt_loader()
-        
+
     def extract_all(
         self,
         transcription: str,
@@ -46,7 +58,10 @@ class NERExtractor:
         previous_medications: List[Dict] = None
     ) -> Dict[str, Any]:
         """
-        Run full NER pipeline with PARALLEL module extraction.
+        Run full NER pipeline with Sequential Batching (Clinical Workflow).
+
+        Batches are executed sequentially to respect Azure rate limits:
+          Batch 1 → wait → Batch 2 → wait → Batch 3
 
         Args:
             transcription: Full conversation text
@@ -57,31 +72,85 @@ class NERExtractor:
             Complete NER JSON
         """
         start_time = time.time()
-        logger.info("Starting NER extraction pipeline (parallel mode)...")
+        logger.info("Starting NER extraction pipeline (sequential batching mode)...")
 
         # 1. Initialize result structure with patient context
         result = self._init_structure(patient_context)
 
-        # 2. Prepare extraction tasks
+        # 2. Prepare medication context for batch 3
         hist_context = json.dumps(previous_medications, ensure_ascii=False) if previous_medications else None
 
-        # Define all extraction tasks: (module_name, result_key, kwargs)
-        extraction_tasks = [
+        # 3. Define batches aligned with clinical workflow
+        # Each batch: List of (module_name, result_key, kwargs)
+
+        # BATCH 1: History Phase - Patient's self-reported information
+        # These come first in a consultation (symptoms, previous meds, family history)
+        batch_1_history = [
             ("chief_complaints", "Chief Complaints (English)", {}),
-            ("medications", "Medications", {"previous_medications": hist_context}),
-            ("diagnosis", "Diagnosis (English)", {}),
-            ("examination", "_examination", {}),  # Special handling needed
-            ("investigations", "Investigations (English)", {}),
-            ("advice", "Advice (Bengali)", {}),
-            ("follow_up", "Follow Up (Bengali)", {}),
-            ("drug_history", "_drug_history", {}),  # Special handling needed
-            ("additional_notes", "_additional_notes", {}),  # Special handling needed
+            ("drug_history", "_drug_history", {}),
+            ("additional_notes", "_additional_notes", {}),
         ]
 
-        # 3. Execute all modules in parallel
+        # BATCH 2: Assessment Phase - Doctor's examination and clinical findings
+        # Doctor examines after hearing complaints, orders tests, forms diagnosis
+        batch_2_assessment = [
+            ("examination", "_examination", {}),
+            ("investigations", "Investigations (English)", {}),
+            ("diagnosis", "Diagnosis (English)", {}),
+        ]
+
+        # BATCH 3: Plan Phase - Treatment decisions
+        # Made after diagnosis: prescriptions, lifestyle advice, follow-up
+        batch_3_plan = [
+            ("medications", "Medications", {"previous_medications": hist_context}),
+            ("advice", "Advice (Bengali)", {}),
+            ("follow_up", "Follow Up (Bengali)", {}),
+        ]
+
+        # 4. Execute batches sequentially
         extraction_results = {}
-        with ThreadPoolExecutor(max_workers=MAX_NER_WORKERS) as executor:
-            # Submit all tasks
+
+        batches = [
+            ("History", batch_1_history),
+            ("Assessment", batch_2_assessment),
+            ("Plan", batch_3_plan),
+        ]
+
+        for batch_name, batch_tasks in batches:
+            batch_start = time.time()
+            logger.info(f"Executing {batch_name} batch ({len(batch_tasks)} modules)...")
+
+            batch_results = self._execute_batch(batch_tasks, transcription)
+            extraction_results.update(batch_results)
+
+            batch_elapsed = time.time() - batch_start
+            logger.info(f"{batch_name} batch completed in {batch_elapsed:.2f}s")
+
+        # 5. Merge results into final structure
+        self._merge_results(result, extraction_results)
+
+        elapsed = time.time() - start_time
+        logger.info(f"NER extraction completed in {elapsed:.2f}s (sequential batching)")
+        return result
+
+    def _execute_batch(
+        self,
+        tasks: List[Tuple[str, str, Dict]],
+        transcription: str
+    ) -> Dict[str, Any]:
+        """
+        Execute a batch of extraction tasks in parallel.
+
+        Args:
+            tasks: List of (module_name, result_key, kwargs)
+            transcription: The transcription text
+
+        Returns:
+            Dict of result_key -> extracted_data
+        """
+        results = {}
+
+        with ThreadPoolExecutor(max_workers=BATCH_WORKERS) as executor:
             future_to_task = {
                 executor.submit(
                     self._extract_module,
@@ -89,24 +158,33 @@ class NERExtractor:
                     transcription,
                     **task[2]  # kwargs
                 ): task
-                for task in extraction_tasks
+                for task in tasks
             }
 
-            # Collect results as they complete
             for future in as_completed(future_to_task):
                 task = future_to_task[future]
                 module_name, result_key, _ = task
+
                 try:
                     data = future.result()
-                    extraction_results[result_key] = data
-                    logger.debug(f"Module {module_name} completed")
+                    results[result_key] = data
+                    logger.debug(f"Module {module_name} completed successfully")
                 except Exception as e:
                     logger.error(f"Module {module_name} failed: {e}")
                     # Set safe default based on expected type
-                    extraction_results[result_key] = {} if module_name in ["examination", "follow_up"] else []
+                    results[result_key] = {} if module_name in ["examination", "follow_up"] else []
 
-        # 4. Merge results into final structure
-        # Direct mappings
+        return results
+
+    def _merge_results(self, result: Dict, extraction_results: Dict) -> None:
+        """
+        Merge extraction results into the final NER structure.
+
+        Args:
+            result: The final NER structure to populate
+            extraction_results: Raw extraction results from all batches
+        """
+        # Direct mappings (top-level fields)
         result["Chief Complaints (English)"] = extraction_results.get("Chief Complaints (English)", [])
         result["Medications"] = extraction_results.get("Medications", [])
         result["Diagnosis (English)"] = extraction_results.get("Diagnosis (English)", [])
@@ -114,13 +192,13 @@ class NERExtractor:
         result["Advice (Bengali)"] = extraction_results.get("Advice (Bengali)", [])
         result["Follow Up (Bengali)"] = extraction_results.get("Follow Up (Bengali)", {})
 
-        # Special handling: Examination
+        # Special handling: Examination (O/E and S/E)
         exam_data = extraction_results.get("_examination", {})
         if exam_data:
             result["Examination (English)"]["O/E (English)"] = exam_data.get("O/E (English)", {})
             result["Examination (English)"]["S/E (English)"] = exam_data.get("S/E (English)", {})
 
-        # Special handling: Drug History
+        # Special handling: Drug History (nested under Examination)
         drug_history = extraction_results.get("_drug_history", [])
         if drug_history:
             result["Examination (English)"]["Drug History (English)"] = drug_history
@@ -135,11 +213,9 @@ class NERExtractor:
                 flat_notes.extend([f"History: {x}" for x in notes_data["Prior Episodes"]])
             if notes_data.get("Allergies"):
                 flat_notes.extend([f"Allergy: {x}" for x in notes_data["Allergies"]])
+            if notes_data.get("Social History"):
+                flat_notes.extend([f"Social: {x}" for x in notes_data["Social History"]])
             result["Examination (English)"]["Additional Notes (English)"] = flat_notes
-
-        elapsed = time.time() - start_time
-        logger.info(f"NER extraction completed in {elapsed:.2f}s (parallel mode)")
-        return result
 
     def _extract_module(
         self,
