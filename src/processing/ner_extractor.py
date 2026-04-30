@@ -41,13 +41,19 @@ class NERExtractor:
     """
 
     def __init__(self):
+        # Log the endpoint being used (for debugging connection issues)
+        logger.info(f"Initializing NER LLM with endpoint: {settings.azure_ner_endpoint}")
+        logger.info(f"Using deployment: {settings.azure_ner_deployment}, API version: {settings.azure_api_version}")
+
         self.llm = AzureChatOpenAI(
             azure_endpoint=settings.azure_ner_endpoint,
             api_key=settings.azure_ner_api_key,
             api_version=settings.azure_api_version,
             deployment_name=settings.azure_ner_deployment,
             # temperature=0.1,  # GPT-5.2 only supports default temperature (1)
-            max_completion_tokens=4000  # GPT-5.2 requires max_completion_tokens instead of max_tokens
+            max_completion_tokens=4000,  # GPT-5.2 requires max_completion_tokens instead of max_tokens
+            timeout=60,           # Request timeout in seconds
+            max_retries=2,        # LangChain internal retries (we have our own retry logic)
         )
         self.prompt_loader = get_prompt_loader()
 
@@ -275,11 +281,19 @@ class NERExtractor:
             except Exception as e:
                 last_error = e
                 error_str = str(e).lower()
+                error_type = type(e).__name__
+
+                # Log detailed error information for debugging
+                logger.warning(
+                    f"Module {prompt_name} error - Type: {error_type}, "
+                    f"Message: {str(e)[:200]}"
+                )
 
                 # Check if it's a rate limit or transient error
                 is_retryable = any(x in error_str for x in [
                     "rate limit", "429", "timeout", "connection",
-                    "temporary", "overloaded", "503", "500"
+                    "temporary", "overloaded", "503", "500", "ssl",
+                    "reset", "refused", "unreachable"
                 ])
 
                 if is_retryable and attempt < max_retries:
@@ -287,14 +301,15 @@ class NERExtractor:
                     delay = base_delay * (2 ** attempt)
                     logger.warning(
                         f"Module {prompt_name} failed (attempt {attempt + 1}/{max_retries + 1}), "
-                        f"retrying in {delay:.1f}s: {e}"
+                        f"retrying in {delay:.1f}s: {error_type}"
                     )
                     time.sleep(delay)
                 else:
                     # Non-retryable error or max retries reached
+                    logger.error(f"Module {prompt_name} - Non-retryable or max retries: {error_type}")
                     break
 
-        logger.error(f"Module {prompt_name} failed after {max_retries + 1} attempts: {last_error}")
+        logger.error(f"Module {prompt_name} failed after {max_retries + 1} attempts: {type(last_error).__name__}: {last_error}")
         # Return safe empty defaults based on expected type
         return {} if prompt_name in ["examination", "follow_up"] else []
 

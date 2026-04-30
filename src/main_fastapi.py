@@ -208,6 +208,77 @@ async def health():
     }
 
 
+@app.get("/api/v1/diagnostic/azure-ner")
+async def diagnostic_azure_ner():
+    """
+    Diagnostic endpoint to test Azure OpenAI NER connectivity.
+    Tests the connection without going through LangChain.
+    """
+    import httpx
+    from config import settings
+
+    endpoint = settings.azure_ner_endpoint
+    deployment = settings.azure_ner_deployment
+    api_version = settings.azure_api_version
+    api_key = settings.azure_ner_api_key
+
+    # Build the full URL
+    url = f"{endpoint.rstrip('/')}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+
+    # Simple test payload
+    payload = {
+        "messages": [{"role": "user", "content": "Say hello"}],
+        "max_completion_tokens": 10
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "api-key": api_key
+    }
+
+    result = {
+        "endpoint": endpoint,
+        "deployment": deployment,
+        "api_version": api_version,
+        "url_tested": url,
+        "api_key_present": bool(api_key and len(api_key) > 10),
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            result["status_code"] = response.status_code
+            result["success"] = response.status_code == 200
+
+            if response.status_code == 200:
+                data = response.json()
+                result["model"] = data.get("model", "unknown")
+                result["message"] = "Azure NER connection successful"
+            else:
+                result["error"] = response.text[:500]
+                result["message"] = "Azure NER connection failed"
+
+    except httpx.ConnectError as e:
+        result["success"] = False
+        result["error_type"] = "ConnectError"
+        result["error"] = str(e)
+        result["message"] = "Failed to connect to Azure endpoint"
+
+    except httpx.TimeoutException as e:
+        result["success"] = False
+        result["error_type"] = "TimeoutError"
+        result["error"] = str(e)
+        result["message"] = "Connection timed out"
+
+    except Exception as e:
+        result["success"] = False
+        result["error_type"] = type(e).__name__
+        result["error"] = str(e)
+        result["message"] = f"Unexpected error: {type(e).__name__}"
+
+    return result
+
+
 # ============================================================================
 # Session Management
 # ============================================================================
