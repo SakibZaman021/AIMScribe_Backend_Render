@@ -438,7 +438,7 @@ flowchart LR
 |-------|------------|---------|
 | **API Framework** | FastAPI / Flask | HTTP API endpoints |
 | **AI - Transcription** | Azure OpenAI GPT-4o-transcribe | Bengali audio to text |
-| **AI - NER** | Azure OpenAI GPT-4o | Entity extraction |
+| **AI - NER** | Azure OpenAI GPT-5.2 | Entity extraction |
 | **Database** | PostgreSQL 14+ | Structured data storage |
 | **Cache & Queue** | Redis 7+ | Job queue and caching |
 | **Object Storage** | MinIO | Audio file storage |
@@ -521,7 +521,7 @@ You need access to Azure OpenAI with the following deployments:
 | Deployment | Model | Purpose |
 |------------|-------|---------|
 | gpt-4o-transcribe | gpt-4o-audio-preview | Bengali audio transcription |
-| gpt-4o | gpt-4o | NER extraction |
+| gpt-4o | gpt-5.2 | NER extraction |
 
 ### How to Get Azure OpenAI Credentials
 
@@ -603,19 +603,7 @@ notepad .env
 
 **Update these values:**
 ```env
-# Azure OpenAI - Transcription
-AZURE_TRANSCRIBE_ENDPOINT=https://your-resource-name.openai.azure.com/
-AZURE_TRANSCRIBE_API_KEY=your-api-key-here
-AZURE_TRANSCRIBE_DEPLOYMENT=gpt-4o-transcribe
 
-# Azure OpenAI - NER
-AZURE_NER_ENDPOINT=https://your-resource-name.openai.azure.com/
-AZURE_NER_API_KEY=your-api-key-here
-AZURE_NER_DEPLOYMENT=gpt-4o
-
-# Database (matches docker-compose.yml)
-POSTGRES_PASSWORD=aimscribe123
-```
 
 ### Step 5: Initialize Database
 
