@@ -68,16 +68,23 @@ class V2Repository:
     # ============================================================
 
     async def create_enrollment_token(
-        self, *, hospital_id: str, created_by: str, ttl_hours: int = 72
+        self, *, hospital_id: str, doctor_id: str, created_by: str,
+        ttl_hours: int = 72
     ) -> str:
-        """Mint a single-use token. Only the hash is stored."""
+        """
+        Mint a single-use token. Only the hash is stored.
+
+        The token carries both the hospital and the doctor, so the machine
+        receives its identity rather than asserting one. This is the only point
+        at which a doctor is named, and an administrator does it.
+        """
         token = new_token()
         async with self._pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO enrollment_tokens
-                    (token_sha256, hospital_id, created_by, expires_at)
-                VALUES ($1, $2, $3, $4)
-            """, hash_token(token), hospital_id, created_by,
+                    (token_sha256, hospital_id, doctor_id, created_by, expires_at)
+                VALUES ($1, $2, $3, $4, $5)
+            """, hash_token(token), hospital_id, doctor_id, created_by,
                  _utcnow() + timedelta(hours=ttl_hours))
         return token
 
@@ -103,7 +110,7 @@ class V2Repository:
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow("""
-                    SELECT hospital_id, expires_at, used_at
+                    SELECT hospital_id, doctor_id, expires_at, used_at
                     FROM enrollment_tokens
                     WHERE token_sha256 = $1
                     FOR UPDATE
@@ -120,12 +127,13 @@ class V2Repository:
 
                 device = await conn.fetchrow("""
                     INSERT INTO devices
-                        (hospital_id, tpm_pubkey, token_sha256, machine_name,
-                         os_version, app_version, protocol_version)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
-                    RETURNING device_id, hospital_id
-                """, row["hospital_id"], tpm_pubkey, hash_token(device_token),
-                     machine_name, os_version, app_version, protocol_version)
+                        (hospital_id, doctor_id, tpm_pubkey, token_sha256,
+                         machine_name, os_version, app_version, protocol_version)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    RETURNING device_id, hospital_id, doctor_id
+                """, row["hospital_id"], row["doctor_id"], tpm_pubkey,
+                     hash_token(device_token), machine_name, os_version,
+                     app_version, protocol_version)
 
                 await conn.execute("""
                     UPDATE enrollment_tokens
@@ -136,6 +144,9 @@ class V2Repository:
         return {
             "device_id": str(device["device_id"]),
             "hospital_id": device["hospital_id"],
+            # The machine learns which doctor it belongs to here, and nowhere
+            # else. Nothing in the browser can change it.
+            "doctor_id": device["doctor_id"],
             "device_token": device_token,
         }
 

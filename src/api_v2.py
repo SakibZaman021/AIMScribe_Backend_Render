@@ -260,8 +260,8 @@ async def enroll_device(body: EnrollRequest):
     Exchange an administrator's one-time token for a device identity.
 
     Deliberately unauthenticated apart from the token itself - the device has no
-    credential yet. The token is single-use, expiring, and carries the hospital,
-    so a device can never assert its own tenancy.
+    credential yet. The token is single-use, expiring, and carries both the
+    hospital and the doctor, so a device can never assert its own identity.
     """
     try:
         pubkey = bytes.fromhex(body.device_pubkey)
@@ -288,8 +288,8 @@ async def enroll_device(body: EnrollRequest):
         device_id=result["device_id"],
         detail={"machine_name": body.machine_name, "app_version": body.app_version},
     )
-    logger.info("Enrolled device %s for hospital %s",
-                result["device_id"], result["hospital_id"])
+    logger.info("Enrolled device %s for doctor %s at hospital %s",
+                result["device_id"], result["doctor_id"], result["hospital_id"])
     return result
 
 
@@ -875,6 +875,9 @@ class HospitalRequest(BaseModel):
 
 class TokenRequest(BaseModel):
     hospital_id: str = Field(..., max_length=64)
+    # The machine being enrolled belongs to one doctor. Naming them here is the
+    # only place a doctor is ever chosen, and an administrator does it.
+    doctor_id: str = Field(..., max_length=64)
     created_by: str = Field(..., max_length=128)
     ttl_hours: int = Field(72, ge=1, le=720)
 
@@ -895,14 +898,17 @@ async def admin_enrollment_token(body: TokenRequest, _: None = Depends(require_a
     database leak cannot be used to enrol devices.
     """
     hospital_id = safe_identifier(body.hospital_id, field="hospital_id")
+    doctor_id = safe_identifier(body.doctor_id, field="doctor_id")
     token = await _repo().create_enrollment_token(
-        hospital_id=hospital_id, created_by=body.created_by, ttl_hours=body.ttl_hours)
+        hospital_id=hospital_id, doctor_id=doctor_id,
+        created_by=body.created_by, ttl_hours=body.ttl_hours)
     await _repo().audit(
         event_type="enrollment_token.created", actor_type="admin",
         actor_id=body.created_by, detail={"hospital_id": hospital_id,
+                                          "doctor_id": doctor_id,
                                           "ttl_hours": body.ttl_hours})
     return {"enrollment_token": token, "hospital_id": hospital_id,
-            "expires_in_hours": body.ttl_hours}
+            "doctor_id": doctor_id, "expires_in_hours": body.ttl_hours}
 
 
 @router.post("/admin/device/{device_id}/revoke")
