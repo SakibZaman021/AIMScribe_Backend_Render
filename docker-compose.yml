@@ -93,12 +93,14 @@ services:
       AZURE_NER_DEPLOYMENT: ${AZURE_NER_DEPLOYMENT:-gpt-5.2-chat}
       AZURE_API_VERSION: ${AZURE_API_VERSION:-2025-01-01-preview}
       # PostgreSQL (Neon Cloud)
-      POSTGRES_HOST: ep-little-water-ad8yhxnc-pooler.c-2.us-east-1.aws.neon.tech
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: neondb
-      POSTGRES_USER: neondb_owner
-      POSTGRES_PASSWORD: npg_4KnVurohUq8g
-      POSTGRES_SSLMODE: require
+      # Credentials come from .env, which is gitignored. They were previously
+      # hardcoded here and published to a public repository.
+      POSTGRES_HOST: ${POSTGRES_HOST:?set POSTGRES_HOST in .env}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_SSLMODE: ${POSTGRES_SSLMODE:-require}
       POSTGRES_POOL_MIN: 2
       POSTGRES_POOL_MAX: 10
       # Redis (container hostname)
@@ -108,15 +110,21 @@ services:
       # MinIO (container hostname)
       MINIO_ENDPOINT: minio:9000
       MINIO_EXTERNAL_ENDPOINT: localhost:9000
-      MINIO_ACCESS_KEY: aimscribe
-      MINIO_SECRET_KEY: aimscribe123
-      MINIO_BUCKET: aimscribe-audio
-      MINIO_SECURE: "false"
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-aimscribe}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-aimscribe123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-aimscribe-audio}
+      MINIO_SECURE: ${MINIO_SECURE:-false}
       # Server
       SERVER_PORT: 6000
       SERVER_HOST: 0.0.0.0
-      LOG_LEVEL: INFO
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PROMPTS_DIR: /app/src/prompts
+      # Protocol 2
+      AIMS_ADMIN_KEY: ${AIMS_ADMIN_KEY:?set AIMS_ADMIN_KEY in .env}
+      AIMS_WORKER_KEY: ${AIMS_WORKER_KEY:?set AIMS_WORKER_KEY in .env}
+      AIMS_RECEIPT_PRIVATE_KEY: ${AIMS_RECEIPT_PRIVATE_KEY:-}
+      AIMS_ALLOWED_ORIGINS: ${AIMS_ALLOWED_ORIGINS:-http://localhost:3000}
+      AIMSCRIBE_WEBHOOK_SECRET: ${AIMSCRIBE_WEBHOOK_SECRET:-}
     depends_on:
       redis:
         condition: service_healthy
@@ -149,12 +157,14 @@ services:
       AZURE_NER_DEPLOYMENT: ${AZURE_NER_DEPLOYMENT:-gpt-5.2-chat}
       AZURE_API_VERSION: ${AZURE_API_VERSION:-2025-01-01-preview}
       # PostgreSQL (Neon Cloud)
-      POSTGRES_HOST: ep-little-water-ad8yhxnc-pooler.c-2.us-east-1.aws.neon.tech
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: neondb
-      POSTGRES_USER: neondb_owner
-      POSTGRES_PASSWORD: npg_4KnVurohUq8g
-      POSTGRES_SSLMODE: require
+      # Credentials come from .env, which is gitignored. They were previously
+      # hardcoded here and published to a public repository.
+      POSTGRES_HOST: ${POSTGRES_HOST:?set POSTGRES_HOST in .env}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_SSLMODE: ${POSTGRES_SSLMODE:-require}
       POSTGRES_POOL_MIN: 2
       POSTGRES_POOL_MAX: 10
       # Redis (container hostname)
