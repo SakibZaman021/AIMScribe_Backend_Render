@@ -17,7 +17,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY worker.py archive.py ./
+COPY worker.py archive.py catalogue.py ./
 
 # The archive volume is mounted here and must be writable by this user.
 RUN useradd --create-home --uid 10001 aimscribe \

@@ -51,7 +51,14 @@ class AsyncRedisClient:
             db=self.db,
             password=self.password,
             ssl=self.ssl,
-            decode_responses=True
+            decode_responses=True,
+            # The worker waits on BRPOP. Without these, a blocking pop that finds
+            # nothing races the socket read deadline and surfaces as
+            # "Timeout reading from redis:6379" on an otherwise healthy queue.
+            socket_timeout=None,          # never time out a blocking read
+            socket_connect_timeout=10,    # but do give up on a dead host
+            socket_keepalive=True,
+            health_check_interval=30,     # notice a silently dropped connection
         )
         # Test connection
         await self._client.ping()

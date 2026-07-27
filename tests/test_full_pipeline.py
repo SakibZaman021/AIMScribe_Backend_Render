@@ -13,8 +13,8 @@ Tests the complete flow:
 
 Prerequisites:
   - Docker services running (docker-compose up -d)
-  - API server running (run_server.bat)
-  - Worker running (run_worker.bat)
+  - API server running (docker compose up -d api)
+  - Worker running (docker compose up -d worker)
 """
 
 import os
@@ -80,7 +80,7 @@ def test_health():
             fail("Some services disconnected")
             return False
     except requests.ConnectionError:
-        fail("Cannot connect to API server. Is run_server.bat running?")
+        fail("Cannot connect to API server. Is the api container running?")
         return False
 
 

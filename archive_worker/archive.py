@@ -26,6 +26,9 @@ ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 ULID_PATTERN = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+# Canonical PCM WAV header written by the agent. Fixed size, no extra chunks.
+WAV_HEADER_BYTES = 44
+
 
 class ArchiveError(RuntimeError):
     """Something about this session cannot be archived safely. Never force it."""
@@ -82,10 +85,18 @@ def _is_within(child: Path, parent: Path) -> bool:
 
 
 def archive_filename(
-    *, patient_ref: str, session_id: str, opened_at: datetime, closed_at: datetime
+    *, patient_ref: str, doctor_id: str, hospital_id: str,
+    opened_at: datetime, closed_at: datetime
 ) -> str:
     """
-    `{patient}_{session}_{HHMM}-{HHMM}.wav`
+    `{patient}_{doctor}_{hospital}_{HHMM}-{HHMM}_{YYYYMMDD}.wav`
+
+        10045_DR001_HOSP001_0930-1015_20260501.wav
+
+    Times are the hospital's local clock, and they are what keeps the name unique:
+    without them a second consultation for the same patient on the same day would
+    collide. The session ULID stays the database key but is deliberately absent
+    here, because a name nobody can read is a name nobody can audit.
 
     The patient reference is here because the folder has to be browsable by
     patient. That is acceptable on this volume only - it is encrypted and
@@ -93,9 +104,51 @@ def archive_filename(
     line, where it would leak into access logs and metrics.
     """
     _checked(patient_ref, ID_PATTERN, "patient_ref")
-    _checked(session_id, ULID_PATTERN, "session_id")
-    return (f"{patient_ref}_{session_id}"
-            f"_{opened_at.strftime('%H%M')}-{closed_at.strftime('%H%M')}.wav")
+    _checked(doctor_id, ID_PATTERN, "doctor_id")
+    _checked(hospital_id, ID_PATTERN, "hospital_id")
+    return (f"{patient_ref}_{doctor_id}_{hospital_id}"
+            f"_{opened_at.strftime('%H%M')}-{closed_at.strftime('%H%M')}"
+            f"_{opened_at.strftime('%Y%m%d')}.wav")
+
+
+def expected_join_bytes(segment_bytes: List[int]) -> int:
+    """
+    Size the joined WAV will have: one 44-byte header plus every segment's audio.
+
+    Used to tell "my own file from a run that died before reporting" apart from
+    "a different session that happens to produce the same name". The old names
+    carried the session ULID and could not collide; these are human-readable, so
+    the check has to be explicit.
+    """
+    return WAV_HEADER_BYTES + sum(max(0, int(b) - WAV_HEADER_BYTES) for b in segment_bytes)
+
+
+def free_destination(directory: Path, filename: str, expected_bytes: int) -> Tuple[Path, bool]:
+    """
+    Resolve where this session's audio goes.
+
+    Returns (path, is_ours). `is_ours` means the file is already there at exactly
+    the size this session would produce - an interrupted run, safe to re-report.
+    Anything else at that name is a genuine collision, so we step to `_02`, `_03`
+    rather than overwrite another patient's consultation.
+    """
+    candidate = directory / filename
+    if not candidate.exists():
+        return candidate, False
+    if candidate.stat().st_size == expected_bytes:
+        return candidate, True
+
+    stem, suffix = filename.rsplit(".", 1)
+    for n in range(2, 100):
+        candidate = directory / f"{stem}_{n:02d}.{suffix}"
+        if not candidate.exists():
+            logger.warning(
+                "Archive name %s is taken by a different session; using %s instead",
+                filename, candidate.name)
+            return candidate, False
+        if candidate.stat().st_size == expected_bytes:
+            return candidate, True
+    raise ArchiveError(f"could not find a free archive name for {filename}")
 
 
 def relative_path(hospital_id: str, doctor_id: str, session_date: str, filename: str) -> str:
@@ -311,7 +364,8 @@ def ensure_space(root: Path, needed: int, *, headroom: int) -> None:
 
 
 __all__ = [
-    "ArchiveError", "JoinResult", "archive_filename", "ensure_space", "free_bytes",
+    "ArchiveError", "JoinResult", "archive_filename",
+    "expected_join_bytes", "free_destination", "ensure_space", "free_bytes",
     "join_wav", "local_times", "relative_path", "session_directory",
     "sha256_bytes", "sha256_file", "update_day_index", "write_manifest",
 ]

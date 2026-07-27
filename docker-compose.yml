@@ -107,9 +107,13 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_DB: 0
-      # MinIO (container hostname)
+      # MinIO. The first is how this container reaches it; the second is baked
+      # into every presigned URL, so it must be resolvable by whoever uses the
+      # URL - the agent on a doctor PC and the archive worker on the AIMS LAB
+      # server, which is a different machine. "localhost" only ever works for
+      # something running on this host, so set the LAN address in .env.
       MINIO_ENDPOINT: minio:9000
-      MINIO_EXTERNAL_ENDPOINT: localhost:9000
+      MINIO_EXTERNAL_ENDPOINT: ${MINIO_EXTERNAL_ENDPOINT:-localhost:9000}
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-aimscribe}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-aimscribe123}
       MINIO_BUCKET: ${MINIO_BUCKET:-aimscribe-audio}
@@ -181,6 +185,10 @@ services:
       LOG_LEVEL: INFO
       PROMPTS_DIR: /app/src/prompts
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-10}
+      # The worker is what posts NER results to CMED, so it is the process that
+      # needs the signing secret. Only the api service had it, so every webhook
+      # went out signed with an empty key and CMED rejected all of them.
+      AIMSCRIBE_WEBHOOK_SECRET: ${AIMSCRIBE_WEBHOOK_SECRET:-}
     depends_on:
       redis:
         condition: service_healthy

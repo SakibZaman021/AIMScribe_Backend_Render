@@ -69,6 +69,13 @@ class AsyncAIMScribeWorker:
         self.transcriber = TranscriberV4()
         self.ner_extractor = NERExtractor()
 
+        if not NERExtractor.is_configured():
+            logger.warning(
+                "Azure NER is not configured (AZURE_NER_ENDPOINT / "
+                "AZURE_NER_API_KEY). The worker runs; entity extraction is "
+                "skipped per job. Audio capture, upload and archiving are "
+                "unaffected.")
+
         # State
         self.running = True
 

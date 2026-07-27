@@ -25,6 +25,7 @@ import asyncio
 import hmac
 import logging
 import os
+import re
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -36,6 +37,10 @@ from db_v2 import V2Repository
 from integrity import ChainError, ReceiptSigner, parse_entry, safe_identifier, safe_session_id
 
 logger = logging.getLogger(__name__)
+
+# Identifiers allowed into a filename. Anything else and the clip goes unnamed
+# rather than letting a separator or a path fragment into the archive.
+_NAME_SAFE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 
 router = APIRouter(prefix="/api/v2", tags=["v2"])
 
@@ -454,6 +459,7 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
         captured_start_at=_parse_time(body.captured_start_at),
         captured_end_at=_parse_time(body.captured_end_at),
         is_final=body.is_final,
+        clip_name=clip_name(session, body.seq_no),
     )
 
     if outcome == "conflict":
@@ -470,6 +476,74 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
         await _queue_transcription(session_id, body, session)
 
     return {"status": "committed", "seq_no": body.seq_no, "duplicate": outcome == "duplicate"}
+
+
+def clip_name(session: Dict[str, Any], seq_no: int) -> Optional[str]:
+    """
+    `{patient}_{doctor}_{hospital}_{YYYYMMDD}_{NNNN}.wav`
+
+        10045_DR001_HOSP001_20260501_0001.wav
+
+    The readable name for one clip, stored so the archive and the database can be
+    searched by eye. Sequence numbers start at 1 and are contiguous within a
+    session, so a gap in the numbering is itself evidence.
+
+    Display only. The object key stays `audio/<ulid>/seg_00001.wav`, because keys
+    reach Cloudflare's access logs and presigned URLs and a patient identifier
+    must never appear there.
+
+    Returns None rather than a partial name if any component is missing - a
+    misleading filename in a clinical archive is worse than no filename.
+    """
+    patient = session.get("patient_id")
+    doctor = session.get("doctor_id")
+    hospital = session.get("hospital_id")
+    date = session.get("session_date") or (
+        session["opened_at"].date() if session.get("opened_at") else None)
+
+    if not (patient and doctor and hospital and date):
+        return None
+    for value in (patient, doctor, hospital):
+        if not _NAME_SAFE.match(str(value)):
+            logger.warning("Clip name skipped: %r is not a safe identifier", value)
+            return None
+
+    return (f"{patient}_{doctor}_{hospital}"
+            f"_{date.strftime('%Y%m%d')}_{seq_no:04d}.wav")
+
+
+async def _delete_bucket_objects(session_id: str) -> int:
+    """
+    Remove a session's clips from object storage.
+
+    Called only after the archive copy is verified and receipts are signed. A
+    failure is logged and left for the retry index rather than raised: the audio
+    is already safe on the AIMS LAB server, and failing the request here would
+    make the worker re-download and re-archive a session that is already done.
+    """
+    repo = _repo()
+    loop = asyncio.get_event_loop()
+    removed = 0
+
+    for segment in await repo.segments_for(session_id):
+        if segment.get("object_deleted_at") is not None:
+            continue
+        try:
+            await loop.run_in_executor(None, _remove_object, segment["object_key"])
+            await repo.mark_object_deleted(session_id, segment["seq_no"])
+            removed += 1
+        except Exception as exc:
+            logger.warning("Could not delete %s from the bucket: %s",
+                           segment["object_key"], exc)
+
+    if removed:
+        logger.info("Deleted %s clip(s) from the bucket for %s", removed, session_id)
+    return removed
+
+
+def _remove_object(object_key: str) -> None:
+    """Delete one object. Sync; called in a thread."""
+    ctx.minio.client.remove_object(ctx.minio.bucket, object_key)
 
 
 def _read_object(object_key: str) -> bytes:
@@ -678,6 +752,9 @@ async def archive_pending(limit: int = 10, _: None = Depends(require_worker)):
             described.append({
                 "seq_no": s["seq_no"],
                 "object_key": s["object_key"],
+                # Readable name for this clip. The worker never derives it, so
+                # there is one implementation and it cannot drift.
+                "clip_name": s.get("clip_name"),
                 "download_url": url,
                 "bytes": s["bytes"],
                 "duration_seconds": float(s["duration_seconds"]),
@@ -702,6 +779,10 @@ async def archive_pending(limit: int = 10, _: None = Depends(require_worker)):
                 "sample_width": session["sample_width"],
             },
             "manifest": session["manifest"],
+            # Gaps in the audio and the reason each was authorised, taken from the
+            # signed chain. Travels with the file so the AIMS LAB server can
+            # explain a gap without reaching back to the cloud.
+            "pauses": await _repo().pauses_for(session["session_id"]),
             "segments": described,
         })
     return {"sessions": payload}
@@ -763,14 +844,23 @@ async def archive_complete(body: ArchiveCompleteRequest, _: None = Depends(requi
     )
 
     await repo.mark_segments_archived(session_id)
+
+    # The bucket is transit. The AIMS LAB server holds a copy whose hash was
+    # recomputed from disk, and every receipt is signed, so the clips have no
+    # further purpose there. Deleting them last means a failure here costs storage,
+    # never audio.
+    removed = await _delete_bucket_objects(session_id)
+
     await repo.audit(
         event_type="session.archived", actor_type="service", actor_id="archive-worker",
         session_id=session_id,
-        detail={"archive_relpath": body.archive_relpath, "receipts_issued": issued + 1},
+        detail={"archive_relpath": body.archive_relpath, "receipts_issued": issued + 1,
+                "objects_deleted": removed},
     )
-    logger.info("Archived %s to %s; issued %s receipt(s)",
-                session_id, body.archive_relpath, issued + 1)
-    return {"status": "archived", "receipts_issued": issued + 1}
+    logger.info("Archived %s to %s; issued %s receipt(s), deleted %s object(s)",
+                session_id, body.archive_relpath, issued + 1, removed)
+    return {"status": "archived", "receipts_issued": issued + 1,
+            "objects_deleted": removed}
 
 
 # ============================================================

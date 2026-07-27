@@ -235,12 +235,22 @@ class V2Repository:
     ) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute("""
-                UPDATE sessions
+                UPDATE sessions s
                    SET closed_at = $2, total_duration_seconds = $3,
                        paused_seconds = $4, segment_count = $5,
                        chain_head_hash = $6, chain_verified_at = now(),
-                       manifest = $7, status = 'closed', updated_at = now()
-                 WHERE session_id = $1
+                       manifest = $7, status = 'closed', updated_at = now(),
+
+                       -- Wall-clock columns, in the hospital's own timezone, so
+                       -- what the console shows matches the filename. opened_at
+                       -- and closed_at stay UTC: one is for reading, the other
+                       -- for arithmetic, and conflating them is how evening
+                       -- consultations end up filed under the previous day.
+                       recording_date = (s.opened_at AT TIME ZONE h.timezone)::date,
+                       start_time     = (s.opened_at AT TIME ZONE h.timezone)::time,
+                       end_time       = ($2 AT TIME ZONE h.timezone)::time
+                  FROM hospitals h
+                 WHERE s.session_id = $1 AND h.hospital_id = s.hospital_id
             """, session_id, closed_at, duration_seconds, paused_seconds,
                  segment_count, chain_head, json.dumps(manifest, ensure_ascii=False))
 
@@ -330,6 +340,7 @@ class V2Repository:
         captured_start_at: Optional[datetime],
         captured_end_at: Optional[datetime],
         is_final: bool,
+        clip_name: Optional[str] = None,
     ) -> str:
         """
         Store a verified segment and its chain entry.
@@ -351,11 +362,11 @@ class V2Repository:
                     INSERT INTO segments
                         (session_id, seq_no, entry_no, object_key, bytes,
                          duration_seconds, sha256, rms_mean, captured_start_at,
-                         captured_end_at, is_final, state)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'committed')
+                         captured_end_at, is_final, state, clip_name)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'committed',$12)
                 """, session_id, seq_no, entry.entry_no, object_key, byte_length,
                      duration_seconds, sha256, rms_mean, captured_start_at,
-                     captured_end_at, is_final)
+                     captured_end_at, is_final, clip_name)
 
                 await conn.execute("""
                     UPDATE sessions
@@ -369,11 +380,51 @@ class V2Repository:
     async def segments_for(self, session_id: str) -> List[Dict[str, Any]]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch("""
-                SELECT seq_no, object_key, bytes, duration_seconds, sha256,
-                       captured_start_at, captured_end_at, is_final, state
+                SELECT seq_no, object_key, clip_name, bytes, duration_seconds,
+                       sha256, captured_start_at, captured_end_at, is_final, state,
+                       object_deleted_at
                 FROM segments WHERE session_id = $1 ORDER BY seq_no
             """, session_id)
         return [dict(row) for row in rows]
+
+    async def pauses_for(self, session_id: str) -> List[Dict[str, Any]]:
+        """
+        Every pause and resume, read from the signed chain.
+
+        Taken from chain_entries rather than a summary column so the reason handed
+        to the archive is the one the device signed at the time.
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT entry_no, entry_type, occurred_at, payload
+                FROM chain_entries
+                WHERE session_id = $1 AND entry_type IN ('pause', 'resume')
+                ORDER BY entry_no
+            """, session_id)
+
+        pauses = []
+        for row in rows:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            payload = payload or {}
+            pauses.append({
+                "entry_no": row["entry_no"],
+                "entry_type": row["entry_type"],
+                "occurred_at": row["occurred_at"].isoformat() if row["occurred_at"] else None,
+                "reason": payload.get("reason"),
+                "authorised_by": payload.get("authorised_by"),
+                "seconds": payload.get("seconds"),
+            })
+        return pauses
+
+    async def mark_object_deleted(self, session_id: str, seq_no: int) -> None:
+        """Record that the bucket copy is gone. The archive copy is unaffected."""
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE segments SET object_deleted_at = now()
+                 WHERE session_id = $1 AND seq_no = $2
+            """, session_id, seq_no)
 
     async def mark_segments_archived(self, session_id: str) -> None:
         async with self._pool.acquire() as conn:
