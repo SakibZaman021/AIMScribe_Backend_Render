@@ -107,13 +107,16 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_DB: 0
-      # MinIO. The first is how this container reaches it; the second is baked
-      # into every presigned URL, so it must be resolvable by whoever uses the
-      # URL - the agent on a doctor PC and the archive worker on the AIMS LAB
-      # server, which is a different machine. "localhost" only ever works for
-      # something running on this host, so set the LAN address in .env.
-      MINIO_ENDPOINT: minio:9000
-      MINIO_EXTERNAL_ENDPOINT: ${MINIO_EXTERNAL_ENDPOINT:-localhost:9000}
+      # Object storage. Both are set from .env so this file works unchanged
+      # against the local MinIO container or Cloudflare R2.
+      #
+      # MINIO_EXTERNAL_ENDPOINT is baked into every presigned URL and must
+      # resolve for whoever opens it: the agent on a doctor PC and the archive
+      # worker on the AIMS LAB server. With MinIO that means a LAN address,
+      # which goes stale when the machine changes network. With R2 leave it
+      # empty - one public hostname serves everyone.
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_EXTERNAL_ENDPOINT: ${MINIO_EXTERNAL_ENDPOINT:-}
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-aimscribe}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-aimscribe123}
       MINIO_BUCKET: ${MINIO_BUCKET:-aimscribe-audio}
