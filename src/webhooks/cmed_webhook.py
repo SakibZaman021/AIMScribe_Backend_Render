@@ -4,6 +4,7 @@ Pushes NER results to CMED system after extraction.
 """
 import hmac
 import hashlib
+import os
 import time
 import json
 import logging
@@ -15,8 +16,16 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-# Webhook secret for HMAC signature (should be in config/env)
-WEBHOOK_SECRET = "aimscribe_webhook_secret_2026"
+# Shared with CMED, which rejects any webhook whose signature does not verify.
+# Must match AIMSCRIBE_WEBHOOK_SECRET in cmed-web. Empty means unsigned webhooks,
+# which CMED drops - so the failure is visible rather than silent.
+WEBHOOK_SECRET = os.getenv("AIMSCRIBE_WEBHOOK_SECRET", "")
+
+if not WEBHOOK_SECRET:
+    logger.critical(
+        "AIMSCRIBE_WEBHOOK_SECRET is not set. NER webhooks will be signed with "
+        "an empty key and CMED will reject them, so prescription fields will "
+        "never populate.")
 
 # Retry configuration
 MAX_RETRIES = 6
