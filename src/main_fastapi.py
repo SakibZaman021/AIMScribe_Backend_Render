@@ -4,11 +4,12 @@ High-performance async API with true parallelism.
 """
 
 import logging
+import os
 from datetime import datetime
 from typing import Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import Depends, FastAPI, Header, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -16,6 +17,12 @@ from config import settings
 from database.postgres_async import AsyncPostgreSQLDatabase
 from storage.minio_client import get_minio_client, MinIOClient
 from message_queue.redis_async import AsyncRedisClient, push_transcription_job_async
+
+# Protocol 2: device identity, integrity chain, purge receipts, archive handshake.
+import api_v2
+from api_v2 import router as v2_router
+from db_v2 import V2Repository
+from integrity import ReceiptSigner
 
 # Configure logging
 logging.basicConfig(
@@ -138,6 +145,21 @@ class AsyncAppContext:
         # MinIO (sync is fine - presigned URLs are fast)
         self.minio = get_minio_client()
 
+        # Protocol 2 layer. Shares the pool above rather than opening a second
+        # one, because Neon's connection budget is small.
+        api_v2.ctx.repo = V2Repository(self.db.pool)
+        api_v2.ctx.minio = self.minio
+        api_v2.ctx.redis = self.redis
+        api_v2.ctx.legacy_db = self.db
+        api_v2.ctx.signer = ReceiptSigner.from_env()
+
+        if api_v2.ctx.signer is None:
+            logger.critical(
+                "AIMS_RECEIPT_PRIVATE_KEY is not set. Audio will be received and "
+                "archived, but no purge receipt can be issued, so agents will keep "
+                "their local copies indefinitely."
+            )
+
         logger.info("All async connections initialized")
 
     async def close(self):
@@ -179,13 +201,28 @@ app = FastAPI(
 )
 
 # CORS middleware
+#
+# Was allow_origins=["*"] with allow_credentials=True, which lets any site on the
+# internet call this API from a logged-in browser. Origins are now an exact
+# allowlist from AIMS_ALLOWED_ORIGINS, and credentials are off - agents and the
+# worker authenticate with headers, so cookies are never needed.
+_allowed_origins = [o.strip() for o in os.getenv("AIMS_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+if not _allowed_origins:
+    logger.warning(
+        "AIMS_ALLOWED_ORIGINS is not set; browser access is disabled. Set it to the "
+        "exact CMED origin, e.g. https://cmed.example.com"
+    )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_allowed_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-API-Key", "X-Device-Token"],
+    max_age=600,
 )
+
+app.include_router(v2_router)
 
 
 # ============================================================================
@@ -208,11 +245,24 @@ async def health():
     }
 
 
+async def _require_admin_key(x_admin_key: Optional[str] = Header(None)) -> None:
+    """Admin gate for diagnostics. Constant-time to avoid leaking the key by timing."""
+    import hmac as _hmac
+    expected = os.getenv("AIMS_ADMIN_KEY", "")
+    if not expected:
+        raise HTTPException(status_code=503, detail="admin key is not configured")
+    if not x_admin_key or not _hmac.compare_digest(x_admin_key, expected):
+        raise HTTPException(status_code=401, detail="invalid admin key")
+
+
 @app.get("/api/v1/diagnostic/azure-ner")
-async def diagnostic_azure_ner():
+async def diagnostic_azure_ner(_: None = Depends(_require_admin_key)):
     """
-    Diagnostic endpoint to test Azure OpenAI NER connectivity.
-    Tests the connection without going through LangChain.
+    Test Azure OpenAI NER connectivity.
+
+    Now admin-only. Unauthenticated, this returned the Azure endpoint, deployment
+    name, API version and whether a key was configured - a free reconnaissance
+    endpoint for anyone who found the service.
     """
     import httpx
     from config import settings

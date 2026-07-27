@@ -49,6 +49,16 @@ class AsyncPostgreSQLDatabase:
         await self._init_database()
         logger.info(f"Async PostgreSQL pool initialized (min={self.min_connections}, max={self.max_connections}, ssl={self.sslmode})")
 
+    @property
+    def pool(self) -> Optional[Pool]:
+        """
+        The underlying connection pool.
+
+        Exposed so the v2 integrity layer (src/db_v2.py) can share this pool
+        rather than opening a second one - Neon's connection budget is small.
+        """
+        return self._pool
+
     async def close(self):
         """Close the connection pool."""
         if self._pool:

@@ -67,6 +67,21 @@ minio>=7.2.0
 redis>=5.0.0
 
 # ================================================================
+# Integrity (v2) - chain verification, purge receipts, grants
+#
+# Ed25519 for device signatures and purge receipts; EdDSA JWT for the
+# recording grants CMED mints. Both must match the agent's versions
+# closely enough that signatures interoperate.
+# ================================================================
+cryptography>=42.0
+pyjwt[crypto]>=2.8.0
+
+# Timezone database. The archive tree is keyed on the hospital's local date, and
+# a slim base image without tzdata would silently file evening consultations
+# under the previous day.
+tzdata>=2024.1
+
+# ================================================================
 # Development/Testing (Optional)
 # ================================================================
 # pytest>=7.4.0
