@@ -198,6 +198,7 @@ class V2Repository:
         audio: Dict[str, int],
         consent_method: str,
         genesis: ChainEntry,
+        object_prefix: Optional[str] = None,
     ) -> bool:
         """
         Create a v2 session and store its genesis chain entry atomically.
@@ -217,13 +218,14 @@ class V2Repository:
                         (session_id, patient_id, doctor_id, hospital_id, device_id,
                          protocol_version, status, session_date, opened_at,
                          recording_date, sample_rate, channels, sample_width,
-                         consent_obtained, consent_method, consent_at)
+                         consent_obtained, consent_method, consent_at,
+                         object_prefix)
                     VALUES ($1,$2,$3,$4,$5, 2, 'active', $6,$7,$6, $8,$9,$10,
-                            TRUE, $11, $7)
+                            TRUE, $11, $7, $12)
                 """, session_id, patient_id, doctor_id, hospital_id, device_id,
                      session_date, opened_at,
                      audio.get("sample_rate"), audio.get("channels"),
-                     audio.get("sample_width"), consent_method)
+                     audio.get("sample_width"), consent_method, object_prefix)
 
                 await self._insert_chain_entry(conn, session_id, genesis)
         return True
@@ -234,7 +236,8 @@ class V2Repository:
                 SELECT session_id, patient_id, doctor_id, hospital_id, device_id,
                        protocol_version, status, session_date, opened_at, closed_at,
                        segment_count, chain_head_hash, archive_relpath, archived_at,
-                       quarantine_reason, sample_rate, channels, sample_width
+                       quarantine_reason, sample_rate, channels, sample_width,
+                       object_prefix
                 FROM sessions WHERE session_id = $1
             """, session_id)
         return dict(row) if row else None

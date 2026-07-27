@@ -212,6 +212,17 @@ def _parse_time(value: Optional[str]) -> datetime:
         return datetime.now(timezone.utc)
 
 
+async def _local_time(hospital_id: str, moment: datetime) -> datetime:
+    """The same instant on the hospital's wall clock."""
+    tz_name = await _repo().hospital_timezone(hospital_id)
+    try:
+        from zoneinfo import ZoneInfo
+        return moment.astimezone(ZoneInfo(tz_name))
+    except Exception:
+        logger.error("Timezone %r unresolvable; using UTC. Install tzdata.", tz_name)
+        return moment.astimezone(timezone.utc)
+
+
 async def _local_date(hospital_id: str, moment: datetime) -> date:
     """
     The archive folder uses the hospital's local date.
@@ -334,6 +345,7 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
         raise HTTPException(status_code=400, detail=f"genesis rejected: {verdict.reason}")
 
     opened_at = _parse_time(body.opened_at)
+    local_opened = await _local_time(hospital_id, opened_at)
     await _repo().open_session(
         session_id=session_id,
         hospital_id=hospital_id,
@@ -342,6 +354,7 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
         device_id=device["device_id"],
         session_date=await _local_date(hospital_id, opened_at),
         opened_at=opened_at,
+        object_prefix=object_prefix(patient_ref, doctor_id, hospital_id, local_opened),
         audio=body.audio.model_dump(),
         consent_method=body.consent_method,
         genesis=genesis,
@@ -373,7 +386,12 @@ async def authorize_segment(body: AuthorizeRequest, device=Depends(require_devic
 
     # Keys are built from the opaque session ULID, never the patient reference:
     # object keys leak into access logs, metrics and error traces.
-    object_key = f"audio/{session['session_id']}/seg_{body.seq_no:05d}.wav"
+    # Readable where a human will see it. Falls back to the session ULID when
+    # the prefix could not be formed, because a key that does not identify its
+    # session is worse than one that cannot be read.
+    prefix = session.get("object_prefix") or session["session_id"]
+    name = clip_name(session, body.seq_no) or f"seg_{body.seq_no:05d}.wav"
+    object_key = f"audio/{prefix}/{name}"
 
     loop = asyncio.get_event_loop()
     upload_url = await loop.run_in_executor(
@@ -403,7 +421,12 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
     session_id = safe_session_id(body.session_id)
     session = await _session_for_device(session_id, device)
 
-    if not body.object_key.startswith(f"audio/{session_id}/"):
+    # The client does not get to choose where its audio lands. Both forms are
+    # accepted: sessions opened before readable keys still use the ULID.
+    allowed = {f"audio/{session_id}/"}
+    if session.get("object_prefix"):
+        allowed.add(f"audio/{session['object_prefix']}/")
+    if not any(body.object_key.startswith(p) for p in allowed):
         raise HTTPException(status_code=400, detail="object_key does not belong to this session")
 
     try:
@@ -476,6 +499,34 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
         await _queue_transcription(session_id, body, session)
 
     return {"status": "committed", "seq_no": body.seq_no, "duplicate": outcome == "duplicate"}
+
+
+def object_prefix(patient: str, doctor: str, hospital: str,
+                  local_opened: datetime) -> Optional[str]:
+    """
+    `{patient}_{doctor}_{hospital}_{HHMM}_{YYYYMMDD}`
+
+        10045_DR001_HOSP001_0930_20260728
+
+    The folder a session's clips live under in object storage, so the storage
+    console can be read by a human. Clips used to sit under the session ULID,
+    which is correct but leaves every folder as 26 random characters with no way
+    to tell whose consultation you are about to download.
+
+    Computed once at session open and stored, so segment authorisation and
+    commit both work from the same value and a client cannot choose where its
+    audio lands.
+
+    Times are the hospital's local clock, matching the archive filename.
+
+    Returns None if any component is unsafe, and the caller falls back to the
+    ULID: a key that does not match the session is worse than an unreadable one.
+    """
+    for value in (patient, doctor, hospital):
+        if not value or not _NAME_SAFE.match(str(value)):
+            return None
+    return (f"{patient}_{doctor}_{hospital}"
+            f"_{local_opened.strftime('%H%M')}_{local_opened.strftime('%Y%m%d')}")
 
 
 def clip_name(session: Dict[str, Any], seq_no: int) -> Optional[str]:
