@@ -47,3 +47,12 @@ htmlcov/
 
 # My recorder project (if not part of main app)
 my_recorder_project/
+
+# Editor and tooling state, per-machine
+.claude/
+.vscode/
+.idea/
+
+# Build markers and caches
+*.tsbuildinfo
+.deps_installed
