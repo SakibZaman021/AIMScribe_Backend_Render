@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 ULID_PATTERN = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# The consultation folder: the audio file's name without its extension. Longer
+# than an identifier because it carries every field, but the same character set.
+FOLDER_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,160}$")
 
 # Canonical PCM WAV header written by the agent. Fixed size, no extra chunks.
 WAV_HEADER_BYTES = 44
@@ -57,14 +60,20 @@ def _checked(value: str, pattern: re.Pattern, field: str) -> str:
 
 
 def session_directory(root: Path, hospital_id: str, doctor_id: str,
-                      session_date: str, patient_ref: str) -> Path:
+                      session_date: str, folder_name: str) -> Path:
     """
-    Build <root>/<HOSPITAL>/<DOCTOR>/<YYYY-MM-DD>/<PATIENT> and prove it stays
-    under root.
+    Build <root>/<HOSPITAL>/<DOCTOR>/<YYYY-MM-DD>/<CONSULTATION> and prove it
+    stays under root.
 
-    The patient level means one folder holds everything from one consultation -
-    the audio and its manifest together - so retrieving a patient's record is
-    opening a folder rather than filtering a day's files by name.
+    The last level is the full consultation name, the same string as the audio
+    file without its extension:
+
+        Hos001/DR001/2026-07-28/145_DR001_Hos001_10_30_10_45_2026_07_28/
+
+    Named for the consultation rather than the patient because a patient can be
+    seen twice in a day - a follow-up, a second opinion - and a patient-only
+    folder would merge two consultations into one directory. The times make it
+    unique.
 
     Two independent defences: a strict allowlist pattern per component, and a
     resolved-path containment check. Either alone would probably do; together they
@@ -74,10 +83,10 @@ def session_directory(root: Path, hospital_id: str, doctor_id: str,
     _checked(hospital_id, ID_PATTERN, "hospital_id")
     _checked(doctor_id, ID_PATTERN, "doctor_id")
     _checked(session_date, DATE_PATTERN, "session_date")
-    _checked(patient_ref, ID_PATTERN, "patient_ref")
+    _checked(folder_name, FOLDER_PATTERN, "folder_name")
 
     root = root.resolve()
-    target = (root / hospital_id / doctor_id / session_date / patient_ref).resolve()
+    target = (root / hospital_id / doctor_id / session_date / folder_name).resolve()
 
     if not _is_within(target, root):
         raise ArchiveError(f"resolved path escapes the archive root: {target}")
@@ -161,14 +170,14 @@ def free_destination(directory: Path, filename: str, expected_bytes: int) -> Tup
 
 
 def relative_path(hospital_id: str, doctor_id: str, session_date: str,
-                  patient_ref: str, filename: str) -> str:
+                  folder_name: str, filename: str) -> str:
     """
     Stored in the database, always relative to the archive root.
 
     An absolute path would break every row the day the volume is remounted or the
     archive moves to bigger disks.
     """
-    return f"{hospital_id}/{doctor_id}/{session_date}/{patient_ref}/{filename}"
+    return f"{hospital_id}/{doctor_id}/{session_date}/{folder_name}/{filename}"
 
 
 def local_times(

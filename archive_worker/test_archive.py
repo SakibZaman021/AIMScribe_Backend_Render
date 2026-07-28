@@ -37,8 +37,9 @@ def make_wav(path: Path, seconds: float, *, rate: int = SAMPLE_RATE,
 # ============================================================
 
 def test_builds_the_expected_tree(tmp_path):
-    directory = archive.session_directory(tmp_path, "HOSP001", "DR001", "2026-07-26", "P1")
-    assert directory == (tmp_path / "HOSP001" / "DR001" / "2026-07-26" / "P1").resolve()
+    directory = archive.session_directory(tmp_path, "HOSP001", "DR001", "2026-07-26", "P1_DR001_HOSP001_09_30_10_15_2026_07_26")
+    assert directory == (tmp_path / "HOSP001" / "DR001" / "2026-07-26" /
+                         "P1_DR001_HOSP001_09_30_10_15_2026_07_26").resolve()
 
 
 @pytest.mark.parametrize("hospital", [
@@ -57,20 +58,20 @@ def test_builds_the_expected_tree(tmp_path):
 def test_traversal_in_hospital_is_rejected(tmp_path, hospital):
     """v1 joined a client-supplied id into a path and could write anywhere."""
     with pytest.raises(ArchiveError):
-        archive.session_directory(tmp_path, hospital, "DR001", "2026-07-26", "P1")
+        archive.session_directory(tmp_path, hospital, "DR001", "2026-07-26", "P1_x")
 
 
 @pytest.mark.parametrize("doctor", ["..", "../x", "C:/Windows", "dr 1", ""])
 def test_traversal_in_doctor_is_rejected(tmp_path, doctor):
     with pytest.raises(ArchiveError):
-        archive.session_directory(tmp_path, "HOSP001", doctor, "2026-07-26", "P1")
+        archive.session_directory(tmp_path, "HOSP001", doctor, "2026-07-26", "P1_x")
 
 
 @pytest.mark.parametrize("bad_date", ["2026-7-26", "26-07-2026", "../2026-07-26",
                                       "2026-07-26/..", "", "not-a-date"])
 def test_bad_date_is_rejected(tmp_path, bad_date):
     with pytest.raises(ArchiveError):
-        archive.session_directory(tmp_path, "HOSP001", "DR001", bad_date, "P1")
+        archive.session_directory(tmp_path, "HOSP001", "DR001", bad_date, "P1_x")
 
 
 def test_filename_shape():
@@ -151,26 +152,39 @@ def test_free_destination_steps_aside_for_a_different_session(tmp_path):
 
 def test_relative_path_has_no_root():
     """Absolute paths in the database break the day the volume is remounted."""
-    rel = archive.relative_path(
-        "HOSP001", "DR001", "2026-05-01", "10045",
-        "10045_DR001_HOSP001_09_30_10_15_2026_05_01.wav")
-    assert rel == ("HOSP001/DR001/2026-05-01/10045/"
-                   "10045_DR001_HOSP001_09_30_10_15_2026_05_01.wav")
+    name = "10045_DR001_HOSP001_09_30_10_15_2026_05_01"
+    rel = archive.relative_path("HOSP001", "DR001", "2026-05-01", name, name + ".wav")
+    assert rel == f"HOSP001/DR001/2026-05-01/{name}/{name}.wav"
     assert not rel.startswith("/")
     assert ":" not in rel
 
 
-def test_session_directory_includes_the_patient(tmp_path):
-    """One folder per consultation: the audio and its manifest together."""
-    d = archive.session_directory(tmp_path, "HOSP001", "DR001", "2026-05-01", "10045")
-    assert d == tmp_path.resolve() / "HOSP001" / "DR001" / "2026-05-01" / "10045"
+def test_folder_is_the_whole_consultation_name(tmp_path):
+    """
+    One directory is one consultation.
+
+    Named for the consultation, not the patient: a patient seen twice in a day
+    would otherwise have both recordings land in the same folder.
+    """
+    name = "145_DR001_Hos001_10_30_10_45_2026_07_28"
+    d = archive.session_directory(tmp_path, "Hos001", "DR001", "2026-07-28", name)
+    assert d == tmp_path.resolve() / "Hos001" / "DR001" / "2026-07-28" / name
 
 
-@pytest.mark.parametrize("patient", ["../escape", "a/b", "", "x" * 100])
-def test_patient_cannot_escape_the_archive(tmp_path, patient):
-    """The patient reference now reaches a directory name, so it is validated."""
+def test_same_patient_twice_in_a_day_gets_two_folders(tmp_path):
+    morning = archive.session_directory(
+        tmp_path, "Hos001", "DR001", "2026-07-28", "145_DR001_Hos001_10_30_10_45_2026_07_28")
+    afternoon = archive.session_directory(
+        tmp_path, "Hos001", "DR001", "2026-07-28", "145_DR001_Hos001_15_00_15_20_2026_07_28")
+    assert morning != afternoon
+    assert morning.parent == afternoon.parent
+
+
+@pytest.mark.parametrize("folder", ["../escape", "a/b", "", "x" * 200])
+def test_folder_cannot_escape_the_archive(tmp_path, folder):
+    """The folder name is built from client-supplied fields, so it is validated."""
     with pytest.raises(ArchiveError):
-        archive.session_directory(tmp_path, "HOSP001", "DR001", "2026-05-01", patient)
+        archive.session_directory(tmp_path, "HOSP001", "DR001", "2026-05-01", folder)
 
 
 # ============================================================

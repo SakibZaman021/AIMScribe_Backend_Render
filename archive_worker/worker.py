@@ -183,14 +183,19 @@ class ArchiveWorker:
             session.get("timezone") or "UTC")
 
         session_date = session.get("session_date") or opened_local.date().isoformat()
-        directory = archive.session_directory(
-            self.settings.archive_root, session["hospital_id"],
-            session["doctor_id"], session_date, session["patient_ref"])
 
+        # The filename comes first: the folder is named after it, so that one
+        # directory is one consultation. A patient seen twice in a day gets two
+        # folders, distinguished by the times in the name.
         filename = archive.archive_filename(
             patient_ref=session["patient_ref"], doctor_id=session["doctor_id"],
             hospital_id=session["hospital_id"],
             opened_at=opened_local, closed_at=closed_local)
+        folder_name = filename[:-len(".wav")]
+
+        directory = archive.session_directory(
+            self.settings.archive_root, session["hospital_id"],
+            session["doctor_id"], session_date, folder_name)
 
         # The name no longer carries the session ULID, so an existing file is only
         # ours if it is exactly the size this session would produce. Anything else
@@ -199,7 +204,7 @@ class ArchiveWorker:
         destination, already_ours = archive.free_destination(directory, filename, expected)
         relpath = archive.relative_path(
             session["hospital_id"], session["doctor_id"], session_date,
-            session["patient_ref"], destination.name)
+            folder_name, destination.name)
 
         # Already done? Re-report rather than re-downloading; /archive/complete is
         # idempotent, and this is the normal path when a previous run was
