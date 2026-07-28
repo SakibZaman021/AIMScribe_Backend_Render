@@ -337,24 +337,19 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
     # checked against the register for this hospital before anything is recorded.
     # Without this, free text returns and with it DR_TEST_001 and a folder in the
     # archive nobody will ever open.
+    # Refused rather than reattributed. The agent already substitutes the
+    # machine's own doctor when CMED names nobody, so an unrecognised name
+    # arriving here is a real misconfiguration - and a consultation quietly filed
+    # under a doctor who was not in the room is worse than one that did not start.
     if not await _repo().doctor_is_credentialed(doctor_id, hospital_id):
-        fallback = device.get("doctor_id")
-        if fallback and await _repo().doctor_is_credentialed(fallback, hospital_id):
-            # The machine's own doctor is a safe default when CMED names someone
-            # unrecognised - better a consultation attributed to the room's usual
-            # doctor than one attributed to nobody.
-            logger.warning("Doctor %r is not credentialed at %s; using the device's %r",
-                           doctor_id, hospital_id, fallback)
-            await _repo().raise_alert(
-                alert_type="doctor_not_credentialed", severity="warning",
-                session_id=session_id, device_id=device["device_id"],
-                detail={"claimed": doctor_id, "used": fallback, "hospital": hospital_id})
-            doctor_id = fallback
-        else:
-            raise HTTPException(
-                status_code=403,
-                detail=(f"{doctor_id} is not registered to record at {hospital_id}. "
-                        f"Ask an administrator to add them."))
+        await _repo().raise_alert(
+            alert_type="doctor_not_credentialed", severity="warning",
+            session_id=session_id, device_id=device["device_id"],
+            detail={"claimed": doctor_id, "hospital": hospital_id})
+        raise HTTPException(
+            status_code=403,
+            detail=(f"{doctor_id} is not registered to record at {hospital_id}. "
+                    f"Ask an administrator to add them."))
 
     genesis = await _entry_or_400(body.genesis)
     if genesis.entry_no != 0 or genesis.entry_type != "open":
