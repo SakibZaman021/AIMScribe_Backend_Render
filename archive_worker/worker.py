@@ -112,8 +112,11 @@ class ArchiveWorker:
 
         while self.running:
             try:
-                processed = self.drain_once()
-                if processed == 0:
+                # Sleep unless something actually succeeded. "Processed" used to
+                # include failures, so a session that could never be archived was
+                # retried as fast as the network allowed - a hot loop against the
+                # backend that looked, in the log, like the worker was busy.
+                if self.drain_once() == 0:
                     self._sleep(self.settings.poll_seconds)
             except KeyboardInterrupt:
                 break
@@ -146,6 +149,7 @@ class ArchiveWorker:
             try:
                 self.archive_session(session)
                 self.archived += 1
+                processed += 1
             except ArchiveError as exc:
                 # Expected, recoverable: leave it pending and try again next pass.
                 self.failed += 1
@@ -155,7 +159,6 @@ class ArchiveWorker:
                 self.failed += 1
                 logger.error("Session %s failed unexpectedly: %s",
                              session.get("session_id"), exc, exc_info=True)
-            processed += 1
         return processed
 
     def fetch_pending(self) -> List[Dict[str, Any]]:

@@ -494,20 +494,36 @@ class V2Repository:
         """
         Sessions that are closed, verified, and not yet archived.
 
+        Selected on the facts - closed, unarchived, unquarantined, with audio -
+        rather than on status = 'closed'. The transcription pipeline also writes
+        that column and moves a session to 'completed', which quietly removed it
+        from this list: its audio was never archived, so no purge receipt was
+        ever issued, so it sat on the doctor's PC forever. Nothing was lost, but
+        nothing progressed either, and the only visible symptom was disk use.
+
         Quarantined sessions are excluded: they are held for review, never
         archived automatically and never purged from the agent.
+
+        Sessions with no committed segments are excluded too. There is nothing to
+        fetch, so they can never succeed, and leaving them here meant the worker
+        retried them on every pass forever.
         """
         async with self._pool.acquire() as conn:
             rows = await conn.fetch("""
-                SELECT session_id, hospital_id, doctor_id, patient_id, session_date,
-                       opened_at, closed_at, total_duration_seconds, segment_count,
-                       sample_rate, channels, sample_width, manifest
-                FROM sessions
-                WHERE closed_at IS NOT NULL
-                  AND archived_at IS NULL
-                  AND status = 'closed'
-                  AND protocol_version >= 2
-                ORDER BY closed_at
+                SELECT s.session_id, s.hospital_id, s.doctor_id, s.patient_id,
+                       s.session_date, s.opened_at, s.closed_at,
+                       s.total_duration_seconds, s.segment_count,
+                       s.sample_rate, s.channels, s.sample_width, s.manifest
+                FROM sessions s
+                WHERE s.closed_at IS NOT NULL
+                  AND s.archived_at IS NULL
+                  AND s.quarantine_reason IS NULL
+                  AND s.status <> 'quarantined'
+                  AND s.protocol_version >= 2
+                  AND EXISTS (SELECT 1 FROM segments g
+                               WHERE g.session_id = s.session_id
+                                 AND g.state = 'committed')
+                ORDER BY s.closed_at
                 LIMIT $1
             """, limit)
         return [dict(row) for row in rows]
