@@ -33,47 +33,67 @@ class MinIOClient:
         secret_key: str,
         bucket: str,
         secure: bool = False,
-        external_endpoint: str = None
+        external_endpoint: str = None,
+        region: str = "us-east-1"
     ):
         """
-        Initialize MinIO client.
+        Initialize the object storage client. S3-compatible: MinIO or Cloudflare R2.
 
         Args:
-            endpoint: MinIO server endpoint (host:port)
-            access_key: Access key (username)
-            secret_key: Secret key (password)
-            bucket: Default bucket name
-            secure: Use HTTPS if True
-            external_endpoint: External endpoint for presigned URLs (for clients outside Docker)
+            endpoint: storage endpoint (host:port for MinIO,
+                      <account>.r2.cloudflarestorage.com for R2)
+            access_key: access key
+            secret_key: secret key
+            bucket: default bucket name
+            secure: use HTTPS. Always true for R2.
+            external_endpoint: endpoint baked into presigned URLs, for clients
+                      that cannot reach the internal one. For R2 leave this
+                      unset: the endpoint is already publicly reachable, which
+                      is the whole reason R2 avoids the problem below.
+            region: signing region. R2 requires "auto"; MinIO accepts anything
+                      as long as it matches. The region is part of the SigV4
+                      signature, so a mismatch fails every presigned request
+                      with SignatureDoesNotMatch and nothing more specific.
+
+        On external_endpoint: a presigned URL carries the address it was signed
+        for. Pointing it at a LAN address means every in-flight URL breaks the
+        moment the machine's DHCP lease changes - which has already cost one
+        session here. R2 removes the problem by having one stable public
+        hostname for everyone.
         """
         self.endpoint = endpoint
         self.external_endpoint = external_endpoint or endpoint
         self.bucket = bucket
         self.secure = secure
+        self.region = region
 
         # Internal client for operations (uploads, downloads, bucket checks)
         self.client = Minio(
             endpoint,
             access_key=access_key,
             secret_key=secret_key,
-            secure=secure
+            secure=secure,
+            region=region
         )
 
-        # External client for presigned URLs only
-        # Uses fixed region to avoid network calls to unreachable external endpoint
+        # External client for presigned URLs only. The region is fixed rather
+        # than discovered, because discovery would call an endpoint this process
+        # may not be able to reach.
         if external_endpoint and external_endpoint != endpoint:
             self.presign_client = Minio(
                 external_endpoint,
                 access_key=access_key,
                 secret_key=secret_key,
                 secure=secure,
-                region="us-east-1"  # Fixed region to skip server query
+                region=region
             )
         else:
             self.presign_client = self.client
 
         self._ensure_bucket_exists()
-        logger.info(f"MinIO client initialized: {endpoint}/{bucket} (external: {self.external_endpoint})")
+        logger.info(
+            f"Object storage initialized: {endpoint}/{bucket} "
+            f"(external: {self.external_endpoint}, region: {region}, tls: {secure})")
     
     def _ensure_bucket_exists(self):
         """Check bucket exists (for R2/S3, bucket must be pre-created in dashboard)."""
@@ -336,7 +356,8 @@ def get_minio_client() -> MinIOClient:
             secret_key=settings.minio_secret_key,
             bucket=settings.minio_bucket,
             secure=settings.minio_secure,
-            external_endpoint=settings.minio_external_endpoint
+            external_endpoint=settings.minio_external_endpoint,
+            region=settings.minio_region
         )
 
     return _minio_client

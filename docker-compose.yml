@@ -107,13 +107,23 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_DB: 0
-      # MinIO (container hostname)
-      MINIO_ENDPOINT: minio:9000
-      MINIO_EXTERNAL_ENDPOINT: localhost:9000
+      # Object storage. Both are set from .env so this file works unchanged
+      # against the local MinIO container or Cloudflare R2.
+      #
+      # MINIO_EXTERNAL_ENDPOINT is baked into every presigned URL and must
+      # resolve for whoever opens it: the agent on a doctor PC and the archive
+      # worker on the AIMS LAB server. With MinIO that means a LAN address,
+      # which goes stale when the machine changes network. With R2 leave it
+      # empty - one public hostname serves everyone.
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_EXTERNAL_ENDPOINT: ${MINIO_EXTERNAL_ENDPOINT:-}
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-aimscribe}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-aimscribe123}
       MINIO_BUCKET: ${MINIO_BUCKET:-aimscribe-audio}
       MINIO_SECURE: ${MINIO_SECURE:-false}
+      # Cloudflare R2 requires "auto". Part of the SigV4 signature, so a
+      # mismatch fails every presigned request with SignatureDoesNotMatch.
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
       # Server
       SERVER_PORT: 6000
       SERVER_HOST: 0.0.0.0
@@ -172,15 +182,20 @@ services:
       REDIS_PORT: 6379
       REDIS_DB: 0
       # MinIO (container hostname)
-      MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: aimscribe
-      MINIO_SECRET_KEY: aimscribe123
-      MINIO_BUCKET: aimscribe-audio
-      MINIO_SECURE: "false"
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-aimscribe}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-aimscribe123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-aimscribe-audio}
+      MINIO_SECURE: ${MINIO_SECURE:-false}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
       # Worker Config
       LOG_LEVEL: INFO
       PROMPTS_DIR: /app/src/prompts
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-10}
+      # The worker is what posts NER results to CMED, so it is the process that
+      # needs the signing secret. Only the api service had it, so every webhook
+      # went out signed with an empty key and CMED rejected all of them.
+      AIMSCRIBE_WEBHOOK_SECRET: ${AIMSCRIBE_WEBHOOK_SECRET:-}
     depends_on:
       redis:
         condition: service_healthy

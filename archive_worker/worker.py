@@ -38,6 +38,8 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from catalogue import Catalogue
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import archive
@@ -84,6 +86,8 @@ class ArchiveWorker:
             "X-Worker-Key": settings.worker_key,
             "User-Agent": "AIMScribe-ArchiveWorker/2.0",
         })
+        # Lives beside the audio, so a restored volume brings its index with it.
+        self.catalogue = Catalogue(settings.archive_root / "catalogue.sqlite3")
         self.running = True
         self.archived = 0
         self.failed = 0
@@ -179,21 +183,33 @@ class ArchiveWorker:
             session.get("timezone") or "UTC")
 
         session_date = session.get("session_date") or opened_local.date().isoformat()
+
+        # The filename comes first: the folder is named after it, so that one
+        # directory is one consultation. A patient seen twice in a day gets two
+        # folders, distinguished by the times in the name.
+        filename = archive.archive_filename(
+            patient_ref=session["patient_ref"], doctor_id=session["doctor_id"],
+            hospital_id=session["hospital_id"],
+            opened_at=opened_local, closed_at=closed_local)
+        folder_name = filename[:-len(".wav")]
+
         directory = archive.session_directory(
             self.settings.archive_root, session["hospital_id"],
-            session["doctor_id"], session_date)
+            session["doctor_id"], session_date, folder_name)
 
-        filename = archive.archive_filename(
-            patient_ref=session["patient_ref"], session_id=session_id,
-            opened_at=opened_local, closed_at=closed_local)
-        destination = directory / filename
+        # The name no longer carries the session ULID, so an existing file is only
+        # ours if it is exactly the size this session would produce. Anything else
+        # is a different consultation and must not be overwritten or re-reported.
+        expected = archive.expected_join_bytes([int(s["bytes"]) for s in segments])
+        destination, already_ours = archive.free_destination(directory, filename, expected)
         relpath = archive.relative_path(
-            session["hospital_id"], session["doctor_id"], session_date, filename)
+            session["hospital_id"], session["doctor_id"], session_date,
+            folder_name, destination.name)
 
         # Already done? Re-report rather than re-downloading; /archive/complete is
         # idempotent, and this is the normal path when a previous run was
         # interrupted between writing the file and reporting it.
-        if destination.exists():
+        if already_ours:
             existing = archive.sha256_file(destination)
             logger.info("Session %s already present on disk; re-reporting", session_id)
             self.report_complete(session_id, relpath, existing, destination.stat().st_size)
@@ -221,11 +237,28 @@ class ArchiveWorker:
         archive.write_manifest(destination, session, result)
         archive.update_day_index(directory)
 
+        # The hospital's own index, so "what audio do we hold?" is answerable on
+        # this machine with no network and no cloud account. Never allowed to fail
+        # the archive: losing the index is recoverable, losing the audio is not.
+        try:
+            self.catalogue.record(
+                session=session, archive_relpath=relpath, filename=destination.name,
+                sha256_hex=result.sha256.hex(), byte_length=result.bytes,
+                segments=segments, session_date=session_date,
+                pauses=session.get("pauses") or [])
+        except Exception as exc:
+            logger.error("Could not write the local catalogue for %s: %s",
+                         session_id, exc, exc_info=True)
+
         logger.info("Archived %s -> %s (%.1f MB, %.1f s)",
                     session_id, relpath, result.bytes / 1024 ** 2,
                     result.duration_seconds)
 
-        self.report_complete(session_id, relpath, result.sha256, result.bytes)
+        if self.report_complete(session_id, relpath, result.sha256, result.bytes):
+            try:
+                self.catalogue.mark_reported(session_id)
+            except Exception as exc:
+                logger.warning("Catalogue not marked reported for %s: %s", session_id, exc)
 
     def download_segments(self, segments: List[Dict[str, Any]], scratch: Path) -> List[Path]:
         """
@@ -265,12 +298,16 @@ class ArchiveWorker:
         return paths
 
     def report_complete(self, session_id: str, relpath: str,
-                        sha256: bytes, byte_length: int) -> None:
+                        sha256: bytes, byte_length: int) -> bool:
         """
         Tell the backend the archive copy exists and hashes correctly.
 
         This is what causes purge receipts to be issued, and therefore the only
         thing that ever authorises a doctor PC to delete its local audio.
+
+        Returns True when the backend accepted it. False means the audio is on
+        disk but unacknowledged - the catalogue keeps it in `unreported()` and the
+        agent rightly keeps its local copy.
         """
         response = self.session.post(
             f"{self.settings.backend_url}/api/v2/archive/complete",
@@ -285,11 +322,13 @@ class ArchiveWorker:
         )
         if response.status_code == 409:
             logger.warning("Session %s is quarantined; no receipts issued", session_id)
-            return
+            return False
         response.raise_for_status()
-        issued = response.json().get("receipts_issued", 0)
-        logger.info("Session %s reported complete; %s purge receipt(s) issued",
-                    session_id, issued)
+        body = response.json()
+        logger.info("Session %s reported complete; %s purge receipt(s) issued, "
+                    "%s clip(s) deleted from the bucket", session_id,
+                    body.get("receipts_issued", 0), body.get("objects_deleted", 0))
+        return True
 
 
 def main() -> int:

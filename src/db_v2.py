@@ -68,16 +68,23 @@ class V2Repository:
     # ============================================================
 
     async def create_enrollment_token(
-        self, *, hospital_id: str, created_by: str, ttl_hours: int = 72
+        self, *, hospital_id: str, doctor_id: str, created_by: str,
+        ttl_hours: int = 72
     ) -> str:
-        """Mint a single-use token. Only the hash is stored."""
+        """
+        Mint a single-use token. Only the hash is stored.
+
+        The token carries both the hospital and the doctor, so the machine
+        receives its identity rather than asserting one. This is the only point
+        at which a doctor is named, and an administrator does it.
+        """
         token = new_token()
         async with self._pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO enrollment_tokens
-                    (token_sha256, hospital_id, created_by, expires_at)
-                VALUES ($1, $2, $3, $4)
-            """, hash_token(token), hospital_id, created_by,
+                    (token_sha256, hospital_id, doctor_id, created_by, expires_at)
+                VALUES ($1, $2, $3, $4, $5)
+            """, hash_token(token), hospital_id, doctor_id, created_by,
                  _utcnow() + timedelta(hours=ttl_hours))
         return token
 
@@ -103,7 +110,7 @@ class V2Repository:
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow("""
-                    SELECT hospital_id, expires_at, used_at
+                    SELECT hospital_id, doctor_id, expires_at, used_at
                     FROM enrollment_tokens
                     WHERE token_sha256 = $1
                     FOR UPDATE
@@ -120,12 +127,13 @@ class V2Repository:
 
                 device = await conn.fetchrow("""
                     INSERT INTO devices
-                        (hospital_id, tpm_pubkey, token_sha256, machine_name,
-                         os_version, app_version, protocol_version)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
-                    RETURNING device_id, hospital_id
-                """, row["hospital_id"], tpm_pubkey, hash_token(device_token),
-                     machine_name, os_version, app_version, protocol_version)
+                        (hospital_id, doctor_id, tpm_pubkey, token_sha256,
+                         machine_name, os_version, app_version, protocol_version)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    RETURNING device_id, hospital_id, doctor_id
+                """, row["hospital_id"], row["doctor_id"], tpm_pubkey,
+                     hash_token(device_token), machine_name, os_version,
+                     app_version, protocol_version)
 
                 await conn.execute("""
                     UPDATE enrollment_tokens
@@ -136,6 +144,9 @@ class V2Repository:
         return {
             "device_id": str(device["device_id"]),
             "hospital_id": device["hospital_id"],
+            # The machine learns which doctor it belongs to here, and nowhere
+            # else. Nothing in the browser can change it.
+            "doctor_id": device["doctor_id"],
             "device_token": device_token,
         }
 
@@ -187,6 +198,7 @@ class V2Repository:
         audio: Dict[str, int],
         consent_method: str,
         genesis: ChainEntry,
+        object_prefix: Optional[str] = None,
     ) -> bool:
         """
         Create a v2 session and store its genesis chain entry atomically.
@@ -206,13 +218,14 @@ class V2Repository:
                         (session_id, patient_id, doctor_id, hospital_id, device_id,
                          protocol_version, status, session_date, opened_at,
                          recording_date, sample_rate, channels, sample_width,
-                         consent_obtained, consent_method, consent_at)
+                         consent_obtained, consent_method, consent_at,
+                         object_prefix)
                     VALUES ($1,$2,$3,$4,$5, 2, 'active', $6,$7,$6, $8,$9,$10,
-                            TRUE, $11, $7)
+                            TRUE, $11, $7, $12)
                 """, session_id, patient_id, doctor_id, hospital_id, device_id,
                      session_date, opened_at,
                      audio.get("sample_rate"), audio.get("channels"),
-                     audio.get("sample_width"), consent_method)
+                     audio.get("sample_width"), consent_method, object_prefix)
 
                 await self._insert_chain_entry(conn, session_id, genesis)
         return True
@@ -223,7 +236,8 @@ class V2Repository:
                 SELECT session_id, patient_id, doctor_id, hospital_id, device_id,
                        protocol_version, status, session_date, opened_at, closed_at,
                        segment_count, chain_head_hash, archive_relpath, archived_at,
-                       quarantine_reason, sample_rate, channels, sample_width
+                       quarantine_reason, sample_rate, channels, sample_width,
+                       object_prefix
                 FROM sessions WHERE session_id = $1
             """, session_id)
         return dict(row) if row else None
@@ -231,18 +245,30 @@ class V2Repository:
     async def close_session(
         self, session_id: str, *, closed_at: datetime, duration_seconds: float,
         paused_seconds: float, segment_count: int, chain_head: bytes,
-        manifest: Dict[str, Any],
+        manifest: Dict[str, Any], close_reason: str = "",
     ) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute("""
-                UPDATE sessions
+                UPDATE sessions s
                    SET closed_at = $2, total_duration_seconds = $3,
                        paused_seconds = $4, segment_count = $5,
                        chain_head_hash = $6, chain_verified_at = now(),
-                       manifest = $7, status = 'closed', updated_at = now()
-                 WHERE session_id = $1
+                       manifest = $7, close_reason = $8,
+                       status = 'closed', updated_at = now(),
+
+                       -- Wall-clock columns, in the hospital's own timezone, so
+                       -- what the console shows matches the filename. opened_at
+                       -- and closed_at stay UTC: one is for reading, the other
+                       -- for arithmetic, and conflating them is how evening
+                       -- consultations end up filed under the previous day.
+                       recording_date = (s.opened_at AT TIME ZONE h.timezone)::date,
+                       start_time     = (s.opened_at AT TIME ZONE h.timezone)::time,
+                       end_time       = ($2 AT TIME ZONE h.timezone)::time
+                  FROM hospitals h
+                 WHERE s.session_id = $1 AND h.hospital_id = s.hospital_id
             """, session_id, closed_at, duration_seconds, paused_seconds,
-                 segment_count, chain_head, json.dumps(manifest, ensure_ascii=False))
+                 segment_count, chain_head, json.dumps(manifest, ensure_ascii=False),
+                 close_reason or None)
 
     async def quarantine_session(self, session_id: str, reason: str) -> None:
         async with self._pool.acquire() as conn:
@@ -330,6 +356,7 @@ class V2Repository:
         captured_start_at: Optional[datetime],
         captured_end_at: Optional[datetime],
         is_final: bool,
+        clip_name: Optional[str] = None,
     ) -> str:
         """
         Store a verified segment and its chain entry.
@@ -351,11 +378,11 @@ class V2Repository:
                     INSERT INTO segments
                         (session_id, seq_no, entry_no, object_key, bytes,
                          duration_seconds, sha256, rms_mean, captured_start_at,
-                         captured_end_at, is_final, state)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'committed')
+                         captured_end_at, is_final, state, clip_name)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'committed',$12)
                 """, session_id, seq_no, entry.entry_no, object_key, byte_length,
                      duration_seconds, sha256, rms_mean, captured_start_at,
-                     captured_end_at, is_final)
+                     captured_end_at, is_final, clip_name)
 
                 await conn.execute("""
                     UPDATE sessions
@@ -369,11 +396,88 @@ class V2Repository:
     async def segments_for(self, session_id: str) -> List[Dict[str, Any]]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch("""
-                SELECT seq_no, object_key, bytes, duration_seconds, sha256,
-                       captured_start_at, captured_end_at, is_final, state
+                SELECT seq_no, object_key, clip_name, bytes, duration_seconds,
+                       sha256, captured_start_at, captured_end_at, is_final, state,
+                       object_deleted_at
                 FROM segments WHERE session_id = $1 ORDER BY seq_no
             """, session_id)
         return [dict(row) for row in rows]
+
+    async def doctor_is_credentialed(self, doctor_id: str, hospital_id: str) -> bool:
+        """
+        May this doctor record at this hospital?
+
+        Checked on every session open. The doctor now comes from CMED so that a
+        consulting-room PC can be shared - which means the browser names them
+        again, and the browser is not trusted. The register is what makes a
+        rotating doctor safe and DR_TEST_001 impossible.
+        """
+        async with self._pool.acquire() as conn:
+            return bool(await conn.fetchval("""
+                SELECT 1 FROM doctors
+                 WHERE doctor_id = $1 AND hospital_id = $2 AND active
+            """, doctor_id, hospital_id))
+
+    async def doctors_at(self, hospital_id: str) -> List[Dict[str, Any]]:
+        """The register for one hospital, for the CMED selector."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT doctor_id, full_name FROM doctors
+                 WHERE hospital_id = $1 AND active
+                 ORDER BY full_name
+            """, hospital_id)
+        return [dict(r) for r in rows]
+
+    async def upsert_doctor(self, *, doctor_id: str, hospital_id: str,
+                            full_name: str, active: bool = True) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO doctors (doctor_id, hospital_id, full_name, active)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (doctor_id, hospital_id) DO UPDATE
+                   SET full_name = excluded.full_name,
+                       active    = excluded.active,
+                       updated_at = now()
+            """, doctor_id, hospital_id, full_name, active)
+
+    async def pauses_for(self, session_id: str) -> List[Dict[str, Any]]:
+        """
+        Every pause and resume, read from the signed chain.
+
+        Taken from chain_entries rather than a summary column so the reason handed
+        to the archive is the one the device signed at the time.
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT entry_no, entry_type, occurred_at, payload
+                FROM chain_entries
+                WHERE session_id = $1 AND entry_type IN ('pause', 'resume')
+                ORDER BY entry_no
+            """, session_id)
+
+        pauses = []
+        for row in rows:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            payload = payload or {}
+            pauses.append({
+                "entry_no": row["entry_no"],
+                "entry_type": row["entry_type"],
+                "occurred_at": row["occurred_at"].isoformat() if row["occurred_at"] else None,
+                "reason": payload.get("reason"),
+                "authorised_by": payload.get("authorised_by"),
+                "seconds": payload.get("seconds"),
+            })
+        return pauses
+
+    async def mark_object_deleted(self, session_id: str, seq_no: int) -> None:
+        """Record that the bucket copy is gone. The archive copy is unaffected."""
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE segments SET object_deleted_at = now()
+                 WHERE session_id = $1 AND seq_no = $2
+            """, session_id, seq_no)
 
     async def mark_segments_archived(self, session_id: str) -> None:
         async with self._pool.acquire() as conn:

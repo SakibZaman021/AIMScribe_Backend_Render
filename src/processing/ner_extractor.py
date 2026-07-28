@@ -30,6 +30,15 @@ logger = logging.getLogger(__name__)
 BATCH_WORKERS = 3
 
 
+class NERUnavailable(RuntimeError):
+    """
+    NER cannot run because Azure is not configured.
+
+    Raised per job rather than at startup, so the absence of an optional AI
+    feature never stops audio being captured, uploaded or archived.
+    """
+
+
 class NERExtractor:
     """
     Extracts clinical entities using COT prompts and few-shot examples.
@@ -41,21 +50,43 @@ class NERExtractor:
     """
 
     def __init__(self):
-        # Log the endpoint being used (for debugging connection issues)
-        logger.info(f"Initializing NER LLM with endpoint: {settings.azure_ner_endpoint}")
-        logger.info(f"Using deployment: {settings.azure_ner_deployment}, API version: {settings.azure_api_version}")
-
-        self.llm = AzureChatOpenAI(
-            azure_endpoint=settings.azure_ner_endpoint,
-            api_key=settings.azure_ner_api_key,
-            api_version=settings.azure_api_version,
-            deployment_name=settings.azure_ner_deployment,
-            # temperature=0.1,  # GPT-5.2 only supports default temperature (1)
-            max_completion_tokens=4000,  # GPT-5.2 requires max_completion_tokens instead of max_tokens
-            timeout=60,           # Request timeout in seconds
-            max_retries=2,        # LangChain internal retries (we have our own retry logic)
-        )
+        # The client is built on first use, not here.
+        #
+        # AzureChatOpenAI validates credentials in its constructor. Building it
+        # eagerly meant that with no Azure key the worker raised during startup,
+        # exited, and was restarted forever by Docker - so a missing NER key took
+        # down transcription, the queue consumer and archiving too. NER is one
+        # feature; it should fail on its own, per job, and leave the rest running.
+        self._llm = None
         self.prompt_loader = get_prompt_loader()
+
+    @property
+    def llm(self):
+        if self._llm is None:
+            if not settings.azure_ner_api_key or not settings.azure_ner_endpoint:
+                raise NERUnavailable(
+                    "Azure NER is not configured: set AZURE_NER_ENDPOINT and "
+                    "AZURE_NER_API_KEY. Recording, upload and archiving are "
+                    "unaffected; only entity extraction is disabled.")
+
+            logger.info(f"Initializing NER LLM with endpoint: {settings.azure_ner_endpoint}")
+            logger.info(f"Using deployment: {settings.azure_ner_deployment}, API version: {settings.azure_api_version}")
+
+            self._llm = AzureChatOpenAI(
+                azure_endpoint=settings.azure_ner_endpoint,
+                api_key=settings.azure_ner_api_key,
+                api_version=settings.azure_api_version,
+                deployment_name=settings.azure_ner_deployment,
+                # temperature=0.1,  # GPT-5.2 only supports default temperature (1)
+                max_completion_tokens=4000,  # GPT-5.2 requires max_completion_tokens instead of max_tokens
+                timeout=60,           # Request timeout in seconds
+                max_retries=2,        # LangChain internal retries (we have our own retry logic)
+            )
+        return self._llm
+
+    @staticmethod
+    def is_configured() -> bool:
+        return bool(settings.azure_ner_api_key and settings.azure_ner_endpoint)
 
     def extract_all(
         self,

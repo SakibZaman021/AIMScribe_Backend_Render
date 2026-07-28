@@ -459,13 +459,6 @@ aimscribe-backend/
 ├── RUN_GUIDE.md                   # Quick start guide
 │
 ├── Batch Scripts (Windows)
-│   ├── install.bat                # Install dependencies
-│   ├── start_services.bat         # Start Docker services
-│   ├── stop_services.bat          # Stop Docker services
-│   ├── run_setup.bat              # Initialize database
-│   ├── run_tests.bat              # Run API tests
-│   ├── run_server.bat             # Start API server
-│   └── run_worker.bat             # Start worker
 │
 ├── src/                           # Source code
 │   ├── main.py                    # Flask API server
@@ -540,17 +533,12 @@ You need access to Azure OpenAI with the following deployments:
 ### Step 1: Navigate to the Project
 
 ```powershell
-cd "D:\AIMS LAB REVIEW PAPER\pyaudio secondary version\aimscribe-backend"
+cd path\to\AIMScribe_Backend_Render
 ```
 
 ### Step 2: Install Python Dependencies
 
-**Option A: Using batch script (Recommended)**
-```
-Double-click: install.bat
-```
-
-**Option B: Manual installation**
+**Manual installation**
 ```powershell
 # Create virtual environment
 python -m venv venv
@@ -570,19 +558,14 @@ pip install python-dotenv
 
 **Make sure Docker Desktop is running first!**
 
-**Option A: Using batch script (Recommended)**
-```
-Double-click: start_services.bat
-```
-
-**Option B: Using command line**
+**Using command line**
 ```powershell
-docker-compose up -d
+docker compose up -d
 ```
 
 **Verify services are running:**
 ```powershell
-docker-compose ps
+docker compose ps
 ```
 
 Expected output:
@@ -607,12 +590,7 @@ notepad .env
 
 ### Step 5: Initialize Database
 
-**Option A: Using batch script (Recommended)**
-```
-Double-click: run_setup.bat
-```
-
-**Option B: Using command line**
+**Using command line**
 ```powershell
 .\venv\Scripts\activate
 python scripts/setup.py
@@ -620,12 +598,7 @@ python scripts/setup.py
 
 ### Step 6: Test API Connections
 
-**Option A: Using batch script (Recommended)**
-```
-Double-click: run_tests.bat
-```
-
-**Option B: Using command line**
+**Using command line**
 ```powershell
 .\venv\Scripts\activate
 python tests/test_azure_apis.py
@@ -641,11 +614,6 @@ You need to run **TWO** processes simultaneously:
 
 #### Terminal 1: API Server
 
-```
-Double-click: run_server.bat
-```
-
-Or manually:
 ```powershell
 .\venv\Scripts\activate
 python src/main.py
@@ -659,11 +627,6 @@ Expected output:
 
 #### Terminal 2: Worker
 
-```
-Double-click: run_worker.bat
-```
-
-Or manually:
 ```powershell
 .\venv\Scripts\activate
 python src/worker.py
@@ -838,7 +801,7 @@ Response:
 docker info
 
 # Restart Docker Desktop, then retry
-docker-compose up -d
+docker compose up -d
 ```
 
 **Port already in use:**
@@ -855,7 +818,7 @@ netstat -ano | findstr :5432
 docker logs aimscribe-postgres
 
 # Restart container
-docker-compose restart postgres
+docker compose restart postgres
 ```
 
 ### Azure API Issues
@@ -885,13 +848,13 @@ docker exec aimscribe-redis redis-cli ping
 .\venv\Scripts\activate
 
 # Start all Docker services
-docker-compose up -d
+docker compose up -d
 
 # Stop all Docker services
-docker-compose down
+docker compose down
 
 # View Docker logs
-docker-compose logs -f
+docker compose logs -f
 
 # Run API tests
 python tests/test_azure_apis.py

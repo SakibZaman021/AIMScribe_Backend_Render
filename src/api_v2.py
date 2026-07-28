@@ -25,6 +25,7 @@ import asyncio
 import hmac
 import logging
 import os
+import re
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -36,6 +37,10 @@ from db_v2 import V2Repository
 from integrity import ChainError, ReceiptSigner, parse_entry, safe_identifier, safe_session_id
 
 logger = logging.getLogger(__name__)
+
+# Identifiers allowed into a filename. Anything else and the clip goes unnamed
+# rather than letting a separator or a path fragment into the archive.
+_NAME_SAFE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 
 router = APIRouter(prefix="/api/v2", tags=["v2"])
 
@@ -168,6 +173,7 @@ class ChainEntryRequest(BaseModel):
 class CloseRequest(BaseModel):
     session_id: str
     closed_at: Optional[str] = None
+    close_reason: str = Field("", max_length=64)
     duration_seconds: float = Field(0, ge=0)
     paused_seconds: float = Field(0, ge=0)
     segment_count: int = Field(0, ge=0)
@@ -205,6 +211,17 @@ def _parse_time(value: Optional[str]) -> datetime:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return datetime.now(timezone.utc)
+
+
+async def _local_time(hospital_id: str, moment: datetime) -> datetime:
+    """The same instant on the hospital's wall clock."""
+    tz_name = await _repo().hospital_timezone(hospital_id)
+    try:
+        from zoneinfo import ZoneInfo
+        return moment.astimezone(ZoneInfo(tz_name))
+    except Exception:
+        logger.error("Timezone %r unresolvable; using UTC. Install tzdata.", tz_name)
+        return moment.astimezone(timezone.utc)
 
 
 async def _local_date(hospital_id: str, moment: datetime) -> date:
@@ -255,8 +272,8 @@ async def enroll_device(body: EnrollRequest):
     Exchange an administrator's one-time token for a device identity.
 
     Deliberately unauthenticated apart from the token itself - the device has no
-    credential yet. The token is single-use, expiring, and carries the hospital,
-    so a device can never assert its own tenancy.
+    credential yet. The token is single-use, expiring, and carries both the
+    hospital and the doctor, so a device can never assert its own identity.
     """
     try:
         pubkey = bytes.fromhex(body.device_pubkey)
@@ -283,8 +300,8 @@ async def enroll_device(body: EnrollRequest):
         device_id=result["device_id"],
         detail={"machine_name": body.machine_name, "app_version": body.app_version},
     )
-    logger.info("Enrolled device %s for hospital %s",
-                result["device_id"], result["hospital_id"])
+    logger.info("Enrolled device %s for doctor %s at hospital %s",
+                result["device_id"], result["doctor_id"], result["hospital_id"])
     return result
 
 
@@ -315,6 +332,25 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
         )
         hospital_id = device["hospital_id"]
 
+    # The doctor comes from CMED, because a consulting-room PC is shared and the
+    # doctor using it changes. That means the browser names them, so the name is
+    # checked against the register for this hospital before anything is recorded.
+    # Without this, free text returns and with it DR_TEST_001 and a folder in the
+    # archive nobody will ever open.
+    # Refused rather than reattributed. The agent already substitutes the
+    # machine's own doctor when CMED names nobody, so an unrecognised name
+    # arriving here is a real misconfiguration - and a consultation quietly filed
+    # under a doctor who was not in the room is worse than one that did not start.
+    if not await _repo().doctor_is_credentialed(doctor_id, hospital_id):
+        await _repo().raise_alert(
+            alert_type="doctor_not_credentialed", severity="warning",
+            session_id=session_id, device_id=device["device_id"],
+            detail={"claimed": doctor_id, "hospital": hospital_id})
+        raise HTTPException(
+            status_code=403,
+            detail=(f"{doctor_id} is not registered to record at {hospital_id}. "
+                    f"Ask an administrator to add them."))
+
     genesis = await _entry_or_400(body.genesis)
     if genesis.entry_no != 0 or genesis.entry_type != "open":
         raise HTTPException(status_code=400, detail="genesis must be entry 0 of type open")
@@ -329,6 +365,7 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
         raise HTTPException(status_code=400, detail=f"genesis rejected: {verdict.reason}")
 
     opened_at = _parse_time(body.opened_at)
+    local_opened = await _local_time(hospital_id, opened_at)
     await _repo().open_session(
         session_id=session_id,
         hospital_id=hospital_id,
@@ -337,6 +374,8 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
         device_id=device["device_id"],
         session_date=await _local_date(hospital_id, opened_at),
         opened_at=opened_at,
+        object_prefix=object_prefix(patient_ref, doctor_id, hospital_id,
+                                    local_opened, session_id),
         audio=body.audio.model_dump(),
         consent_method=body.consent_method,
         genesis=genesis,
@@ -368,7 +407,12 @@ async def authorize_segment(body: AuthorizeRequest, device=Depends(require_devic
 
     # Keys are built from the opaque session ULID, never the patient reference:
     # object keys leak into access logs, metrics and error traces.
-    object_key = f"audio/{session['session_id']}/seg_{body.seq_no:05d}.wav"
+    # Readable where a human will see it. Falls back to the session ULID when
+    # the prefix could not be formed, because a key that does not identify its
+    # session is worse than one that cannot be read.
+    prefix = session.get("object_prefix") or session["session_id"]
+    name = unique_clip_name(session, body.seq_no) or f"seg_{body.seq_no:05d}.wav"
+    object_key = f"audio/{prefix}/{name}"
 
     loop = asyncio.get_event_loop()
     upload_url = await loop.run_in_executor(
@@ -398,7 +442,12 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
     session_id = safe_session_id(body.session_id)
     session = await _session_for_device(session_id, device)
 
-    if not body.object_key.startswith(f"audio/{session_id}/"):
+    # The client does not get to choose where its audio lands. Both forms are
+    # accepted: sessions opened before readable keys still use the ULID.
+    allowed = {f"audio/{session_id}/"}
+    if session.get("object_prefix"):
+        allowed.add(f"audio/{session['object_prefix']}/")
+    if not any(body.object_key.startswith(p) for p in allowed):
         raise HTTPException(status_code=400, detail="object_key does not belong to this session")
 
     try:
@@ -454,6 +503,7 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
         captured_start_at=_parse_time(body.captured_start_at),
         captured_end_at=_parse_time(body.captured_end_at),
         is_final=body.is_final,
+        clip_name=clip_name(session, body.seq_no),
     )
 
     if outcome == "conflict":
@@ -470,6 +520,125 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
         await _queue_transcription(session_id, body, session)
 
     return {"status": "committed", "seq_no": body.seq_no, "duplicate": outcome == "duplicate"}
+
+
+def object_prefix(patient: str, doctor: str, hospital: str,
+                  local_opened: datetime, session_id: str) -> Optional[str]:
+    """
+    `{patient}_{doctor}_{hospital}_{HHMMSS}_{YYYYMMDD}_{tail}`
+
+        10045_DR001_HOSP001_093012_20260728_X97HT
+
+    The folder a session's clips live under in object storage, so the storage
+    console can be read by a human. Clips used to sit under the session ULID,
+    which is correct but leaves every folder as 26 random characters with no way
+    to tell whose consultation you are about to download.
+
+    Computed once at session open and stored, so segment authorisation and
+    commit both work from the same value and a client cannot choose where its
+    audio lands.
+
+    Times are the hospital's local clock, matching the archive filename.
+
+    Seconds and the last five characters of the session id are both here because
+    a minute is not unique. Pressing Start for a new patient closes the current
+    consultation and opens another in the same second; two sessions then shared
+    a prefix, and since clip names carry no session either, the second session's
+    first clip overwrote the first session's. Silently, in object storage, with
+    both rows looking correct in the database.
+
+    Returns None if any component is unsafe, and the caller falls back to the
+    ULID: a key that does not match the session is worse than an unreadable one.
+    """
+    for value in (patient, doctor, hospital):
+        if not value or not _NAME_SAFE.match(str(value)):
+            return None
+    return (f"{patient}_{doctor}_{hospital}"
+            f"_{local_opened.strftime('%H%M%S')}"
+            f"_{local_opened.strftime('%Y%m%d')}"
+            f"_{session_id[-5:]}")
+
+
+def clip_name(session: Dict[str, Any], seq_no: int) -> Optional[str]:
+    """
+    `{patient}_{doctor}_{hospital}_{YYYYMMDD}_{NNNN}.wav`
+
+        10045_DR001_HOSP001_20260501_0001.wav
+
+    The readable name for one clip, stored so the archive and the database can be
+    searched by eye. Sequence numbers start at 1 and are contiguous within a
+    session, so a gap in the numbering is itself evidence.
+
+    Display only. The object key stays `audio/<ulid>/seg_00001.wav`, because keys
+    reach Cloudflare's access logs and presigned URLs and a patient identifier
+    must never appear there.
+
+    Returns None rather than a partial name if any component is missing - a
+    misleading filename in a clinical archive is worse than no filename.
+    """
+    patient = session.get("patient_id")
+    doctor = session.get("doctor_id")
+    hospital = session.get("hospital_id")
+    date = session.get("session_date") or (
+        session["opened_at"].date() if session.get("opened_at") else None)
+
+    if not (patient and doctor and hospital and date):
+        return None
+    for value in (patient, doctor, hospital):
+        if not _NAME_SAFE.match(str(value)):
+            logger.warning("Clip name skipped: %r is not a safe identifier", value)
+            return None
+
+    return (f"{patient}_{doctor}_{hospital}"
+            f"_{date.strftime('%Y%m%d')}_{seq_no:04d}.wav")
+
+
+def unique_clip_name(session: Dict[str, Any], seq_no: int) -> Optional[str]:
+    """
+    The clip name with the session's tail appended.
+
+    Used for the object key, where a collision overwrites audio. The readable
+    name stored in segments.clip_name stays as it is - it is scoped to a session
+    row and cannot collide there.
+    """
+    base = clip_name(session, seq_no)
+    if base is None:
+        return None
+    return f"{base[:-len('.wav')]}_{str(session['session_id'])[-5:]}.wav"
+
+
+async def _delete_bucket_objects(session_id: str) -> int:
+    """
+    Remove a session's clips from object storage.
+
+    Called only after the archive copy is verified and receipts are signed. A
+    failure is logged and left for the retry index rather than raised: the audio
+    is already safe on the AIMS LAB server, and failing the request here would
+    make the worker re-download and re-archive a session that is already done.
+    """
+    repo = _repo()
+    loop = asyncio.get_event_loop()
+    removed = 0
+
+    for segment in await repo.segments_for(session_id):
+        if segment.get("object_deleted_at") is not None:
+            continue
+        try:
+            await loop.run_in_executor(None, _remove_object, segment["object_key"])
+            await repo.mark_object_deleted(session_id, segment["seq_no"])
+            removed += 1
+        except Exception as exc:
+            logger.warning("Could not delete %s from the bucket: %s",
+                           segment["object_key"], exc)
+
+    if removed:
+        logger.info("Deleted %s clip(s) from the bucket for %s", removed, session_id)
+    return removed
+
+
+def _remove_object(object_key: str) -> None:
+    """Delete one object. Sync; called in a thread."""
+    ctx.minio.client.remove_object(ctx.minio.bucket, object_key)
 
 
 def _read_object(object_key: str) -> bytes:
@@ -607,12 +776,29 @@ async def close_session(body: CloseRequest, device=Depends(require_device)):
         segment_count=len(stored_segments),
         chain_head=chain_head,
         manifest=body.manifest or {},
+        close_reason=body.close_reason,
     )
+
+    # A consultation normally ends because the doctor pressed Stop in CMED.
+    # Anything else - stopped from the tray icon, superseded by the next patient,
+    # recovered after the PC died mid-consultation - is worth someone's attention
+    # the same morning, not a fact buried in a log file on a machine in a
+    # consulting room.
+    if body.close_reason and body.close_reason != "doctor_stopped":
+        await repo.raise_alert(
+            alert_type="abnormal_close", severity="warning",
+            session_id=session_id, device_id=device["device_id"],
+            detail={"reason": body.close_reason,
+                    "duration_seconds": body.duration_seconds,
+                    "segments": len(stored_segments)})
+        logger.warning("Session %s ended abnormally: %s", session_id, body.close_reason)
+
     await repo.audit(
         event_type="session.closed", actor_type="device",
         device_id=device["device_id"], session_id=session_id,
         detail={"duration_seconds": body.duration_seconds,
-                "paused_seconds": body.paused_seconds, **summary},
+                "paused_seconds": body.paused_seconds,
+                "close_reason": body.close_reason or "doctor_stopped", **summary},
     )
     logger.info("Session %s closed and verified: %s", session_id, summary["entry_counts"])
     return {"status": "closed", "chain_ok": True, **summary}
@@ -678,6 +864,9 @@ async def archive_pending(limit: int = 10, _: None = Depends(require_worker)):
             described.append({
                 "seq_no": s["seq_no"],
                 "object_key": s["object_key"],
+                # Readable name for this clip. The worker never derives it, so
+                # there is one implementation and it cannot drift.
+                "clip_name": s.get("clip_name"),
                 "download_url": url,
                 "bytes": s["bytes"],
                 "duration_seconds": float(s["duration_seconds"]),
@@ -702,6 +891,10 @@ async def archive_pending(limit: int = 10, _: None = Depends(require_worker)):
                 "sample_width": session["sample_width"],
             },
             "manifest": session["manifest"],
+            # Gaps in the audio and the reason each was authorised, taken from the
+            # signed chain. Travels with the file so the AIMS LAB server can
+            # explain a gap without reaching back to the cloud.
+            "pauses": await _repo().pauses_for(session["session_id"]),
             "segments": described,
         })
     return {"sessions": payload}
@@ -763,14 +956,23 @@ async def archive_complete(body: ArchiveCompleteRequest, _: None = Depends(requi
     )
 
     await repo.mark_segments_archived(session_id)
+
+    # The bucket is transit. The AIMS LAB server holds a copy whose hash was
+    # recomputed from disk, and every receipt is signed, so the clips have no
+    # further purpose there. Deleting them last means a failure here costs storage,
+    # never audio.
+    removed = await _delete_bucket_objects(session_id)
+
     await repo.audit(
         event_type="session.archived", actor_type="service", actor_id="archive-worker",
         session_id=session_id,
-        detail={"archive_relpath": body.archive_relpath, "receipts_issued": issued + 1},
+        detail={"archive_relpath": body.archive_relpath, "receipts_issued": issued + 1,
+                "objects_deleted": removed},
     )
-    logger.info("Archived %s to %s; issued %s receipt(s)",
-                session_id, body.archive_relpath, issued + 1)
-    return {"status": "archived", "receipts_issued": issued + 1}
+    logger.info("Archived %s to %s; issued %s receipt(s), deleted %s object(s)",
+                session_id, body.archive_relpath, issued + 1, removed)
+    return {"status": "archived", "receipts_issued": issued + 1,
+            "objects_deleted": removed}
 
 
 # ============================================================
@@ -785,7 +987,14 @@ class HospitalRequest(BaseModel):
 
 class TokenRequest(BaseModel):
     hospital_id: str = Field(..., max_length=64)
-    created_by: str = Field(..., max_length=128)
+    # The machine being enrolled belongs to one doctor. Naming them here is the
+    # only place a doctor is ever chosen, and an administrator does it.
+    doctor_id: str = Field(..., max_length=64)
+    # Written into the audit trail against every device this token
+    # enrols, and kept for the retention period. Name the team or the
+    # role, not an individual who may leave.
+    created_by: str = Field(..., max_length=128,
+                            examples=["Team_AIMScribe"])
     ttl_hours: int = Field(72, ge=1, le=720)
 
 
@@ -794,6 +1003,48 @@ async def admin_hospital(body: HospitalRequest, _: None = Depends(require_admin)
     hospital_id = safe_identifier(body.hospital_id, field="hospital_id")
     await _repo().upsert_hospital(hospital_id, body.name, body.timezone)
     return {"status": "ok", "hospital_id": hospital_id}
+
+
+class DoctorRequest(BaseModel):
+    doctor_id: str = Field(..., max_length=64)
+    hospital_id: str = Field(..., max_length=64)
+    full_name: str = Field(..., max_length=128)
+    active: bool = True
+
+
+@router.post("/admin/doctor")
+async def admin_doctor(body: DoctorRequest, _: None = Depends(require_admin)):
+    """
+    Add or update a doctor in a hospital's register.
+
+    This is what allows a doctor to record at that hospital. Setting active to
+    false stops new consultations without touching the ones already archived,
+    which still resolve to a name.
+    """
+    doctor_id = safe_identifier(body.doctor_id, field="doctor_id")
+    hospital_id = safe_identifier(body.hospital_id, field="hospital_id")
+    await _repo().upsert_doctor(doctor_id=doctor_id, hospital_id=hospital_id,
+                                full_name=body.full_name, active=body.active)
+    await _repo().audit(
+        event_type="doctor.registered", actor_type="admin",
+        actor_id=doctor_id,
+        detail={"hospital_id": hospital_id, "active": body.active})
+    return {"status": "ok", "doctor_id": doctor_id, "hospital_id": hospital_id,
+            "active": body.active}
+
+
+@router.get("/doctors")
+async def list_doctors(hospital_id: str, device=Depends(require_device)):
+    """
+    The register for one hospital, for the CMED selector.
+
+    Device-authenticated rather than admin: the page needs it on every
+    consultation, and a device may only ask about its own hospital.
+    """
+    hospital = safe_identifier(hospital_id, field="hospital_id")
+    if hospital != device["hospital_id"]:
+        raise HTTPException(status_code=403, detail="not your hospital")
+    return {"hospital_id": hospital, "doctors": await _repo().doctors_at(hospital)}
 
 
 @router.post("/admin/enrollment-token")
@@ -805,14 +1056,17 @@ async def admin_enrollment_token(body: TokenRequest, _: None = Depends(require_a
     database leak cannot be used to enrol devices.
     """
     hospital_id = safe_identifier(body.hospital_id, field="hospital_id")
+    doctor_id = safe_identifier(body.doctor_id, field="doctor_id")
     token = await _repo().create_enrollment_token(
-        hospital_id=hospital_id, created_by=body.created_by, ttl_hours=body.ttl_hours)
+        hospital_id=hospital_id, doctor_id=doctor_id,
+        created_by=body.created_by, ttl_hours=body.ttl_hours)
     await _repo().audit(
         event_type="enrollment_token.created", actor_type="admin",
         actor_id=body.created_by, detail={"hospital_id": hospital_id,
+                                          "doctor_id": doctor_id,
                                           "ttl_hours": body.ttl_hours})
     return {"enrollment_token": token, "hospital_id": hospital_id,
-            "expires_in_hours": body.ttl_hours}
+            "doctor_id": doctor_id, "expires_in_hours": body.ttl_hours}
 
 
 @router.post("/admin/device/{device_id}/revoke")

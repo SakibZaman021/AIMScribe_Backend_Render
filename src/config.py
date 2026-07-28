@@ -107,6 +107,10 @@ class Settings(BaseSettings):
     minio_secret_key: str = Field(default="aimscribe123")
     minio_bucket: str = Field(default="aimscribe-audio")
     minio_secure: bool = Field(default=False)
+    # Signing region. Cloudflare R2 requires "auto"; MinIO accepts anything
+    # provided it matches. It is part of the SigV4 signature, so a mismatch
+    # fails every presigned request with SignatureDoesNotMatch.
+    minio_region: str = Field(default="us-east-1")
     
     # ================================================================
     # Redis Configuration

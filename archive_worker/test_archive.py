@@ -37,8 +37,9 @@ def make_wav(path: Path, seconds: float, *, rate: int = SAMPLE_RATE,
 # ============================================================
 
 def test_builds_the_expected_tree(tmp_path):
-    directory = archive.session_directory(tmp_path, "HOSP001", "DR001", "2026-07-26")
-    assert directory == (tmp_path / "HOSP001" / "DR001" / "2026-07-26").resolve()
+    directory = archive.session_directory(tmp_path, "HOSP001", "DR001", "2026-07-26", "P1_DR001_HOSP001_09_30_10_15_2026_07_26")
+    assert directory == (tmp_path / "HOSP001" / "DR001" / "2026-07-26" /
+                         "P1_DR001_HOSP001_09_30_10_15_2026_07_26").resolve()
 
 
 @pytest.mark.parametrize("hospital", [
@@ -57,52 +58,133 @@ def test_builds_the_expected_tree(tmp_path):
 def test_traversal_in_hospital_is_rejected(tmp_path, hospital):
     """v1 joined a client-supplied id into a path and could write anywhere."""
     with pytest.raises(ArchiveError):
-        archive.session_directory(tmp_path, hospital, "DR001", "2026-07-26")
+        archive.session_directory(tmp_path, hospital, "DR001", "2026-07-26", "P1_x")
 
 
 @pytest.mark.parametrize("doctor", ["..", "../x", "C:/Windows", "dr 1", ""])
 def test_traversal_in_doctor_is_rejected(tmp_path, doctor):
     with pytest.raises(ArchiveError):
-        archive.session_directory(tmp_path, "HOSP001", doctor, "2026-07-26")
+        archive.session_directory(tmp_path, "HOSP001", doctor, "2026-07-26", "P1_x")
 
 
 @pytest.mark.parametrize("bad_date", ["2026-7-26", "26-07-2026", "../2026-07-26",
                                       "2026-07-26/..", "", "not-a-date"])
 def test_bad_date_is_rejected(tmp_path, bad_date):
     with pytest.raises(ArchiveError):
-        archive.session_directory(tmp_path, "HOSP001", "DR001", bad_date)
+        archive.session_directory(tmp_path, "HOSP001", "DR001", bad_date, "P1_x")
 
 
 def test_filename_shape():
-    opened = datetime(2026, 7, 26, 9, 32, tzinfo=timezone.utc)
-    closed = datetime(2026, 7, 26, 9, 47, tzinfo=timezone.utc)
+    """patient_doctor_hospital_start-end_date, the agreed archive contract."""
+    opened = datetime(2026, 5, 1, 9, 30, tzinfo=timezone.utc)
+    closed = datetime(2026, 5, 1, 10, 15, tzinfo=timezone.utc)
     name = archive.archive_filename(
-        patient_ref="P12345", session_id="01KYFR0Z2R744499P1SM490YJ4",
+        patient_ref="145", doctor_id="DR001", hospital_id="Hos001",
         opened_at=opened, closed_at=closed)
-    assert name == "P12345_01KYFR0Z2R744499P1SM490YJ4_0932-0947.wav"
+    assert name == "145_DR001_Hos001_09_30_10_15_2026_05_01.wav"
+
+
+def test_filename_carries_no_session_ulid():
+    """The ULID stays the database key; a reader should never need to parse it."""
+    name = archive.archive_filename(
+        patient_ref="10045", doctor_id="DR001", hospital_id="HOSP001",
+        opened_at=datetime(2026, 5, 1, 9, 30, tzinfo=timezone.utc),
+        closed_at=datetime(2026, 5, 1, 10, 15, tzinfo=timezone.utc))
+    assert not archive.ULID_PATTERN.search(name.replace("_", " "))
+    # patient, doctor, hospital, HH, MM, HH, MM, YYYY, MM, DD
+    assert name.count("_") == 9
+
+
+def test_date_comes_from_the_local_open_time():
+    """A consultation opening at 23:50 belongs to that day, not the next."""
+    opened = datetime(2026, 5, 1, 23, 50, tzinfo=timezone.utc)
+    closed = datetime(2026, 5, 2, 0, 20, tzinfo=timezone.utc)
+    name = archive.archive_filename(
+        patient_ref="10045", doctor_id="DR001", hospital_id="HOSP001",
+        opened_at=opened, closed_at=closed)
+    assert name == "10045_DR001_HOSP001_23_50_00_20_2026_05_01.wav"
 
 
 @pytest.mark.parametrize("patient", ["../x", "P 12345", "", "a" * 100])
 def test_bad_patient_ref_rejected(patient):
     with pytest.raises(ArchiveError):
         archive.archive_filename(
-            patient_ref=patient, session_id="01KYFR0Z2R744499P1SM490YJ4",
+            patient_ref=patient, doctor_id="DR001", hospital_id="HOSP001",
             opened_at=datetime.now(timezone.utc), closed_at=datetime.now(timezone.utc))
 
 
-def test_session_id_must_be_a_ulid():
+@pytest.mark.parametrize("field,value", [
+    ("doctor_id", "../etc"), ("doctor_id", "DR 001"), ("doctor_id", ""),
+    ("hospital_id", "../.."), ("hospital_id", "HOSP/001"), ("hospital_id", ""),
+])
+def test_bad_identifiers_rejected(field, value):
+    """Every component reaches a filename, so every component is validated."""
+    kwargs = {"patient_ref": "10045", "doctor_id": "DR001", "hospital_id": "HOSP001",
+              "opened_at": datetime.now(timezone.utc),
+              "closed_at": datetime.now(timezone.utc)}
+    kwargs[field] = value
     with pytest.raises(ArchiveError):
-        archive.archive_filename(
-            patient_ref="P12345", session_id="not-a-ulid",
-            opened_at=datetime.now(timezone.utc), closed_at=datetime.now(timezone.utc))
+        archive.archive_filename(**kwargs)
+
+
+def test_expected_join_bytes_counts_one_header():
+    """Three 44-byte-header clips join into one file with a single header."""
+    assert archive.expected_join_bytes([44 + 100, 44 + 200, 44 + 300]) == 44 + 600
+
+
+def test_free_destination_reuses_our_own_interrupted_file(tmp_path):
+    target = tmp_path / "10045_DR001_HOSP001_0930-1015_20260501.wav"
+    target.write_bytes(b"x" * 644)
+    path, ours = archive.free_destination(tmp_path, target.name, 644)
+    assert ours is True
+    assert path == target
+
+
+def test_free_destination_steps_aside_for_a_different_session(tmp_path):
+    """A same-named file of a different size is another consultation, not ours."""
+    name = "10045_DR001_HOSP001_0930-1015_20260501.wav"
+    (tmp_path / name).write_bytes(b"x" * 999)
+    path, ours = archive.free_destination(tmp_path, name, 644)
+    assert ours is False
+    assert path.name == "10045_DR001_HOSP001_0930-1015_20260501_02.wav"
+    assert (tmp_path / name).read_bytes() == b"x" * 999
 
 
 def test_relative_path_has_no_root():
     """Absolute paths in the database break the day the volume is remounted."""
-    rel = archive.relative_path("HOSP001", "DR001", "2026-07-26", "P1_X_0932-0947.wav")
-    assert rel == "HOSP001/DR001/2026-07-26/P1_X_0932-0947.wav"
+    name = "10045_DR001_HOSP001_09_30_10_15_2026_05_01"
+    rel = archive.relative_path("HOSP001", "DR001", "2026-05-01", name, name + ".wav")
+    assert rel == f"HOSP001/DR001/2026-05-01/{name}/{name}.wav"
     assert not rel.startswith("/")
     assert ":" not in rel
+
+
+def test_folder_is_the_whole_consultation_name(tmp_path):
+    """
+    One directory is one consultation.
+
+    Named for the consultation, not the patient: a patient seen twice in a day
+    would otherwise have both recordings land in the same folder.
+    """
+    name = "145_DR001_Hos001_10_30_10_45_2026_07_28"
+    d = archive.session_directory(tmp_path, "Hos001", "DR001", "2026-07-28", name)
+    assert d == tmp_path.resolve() / "Hos001" / "DR001" / "2026-07-28" / name
+
+
+def test_same_patient_twice_in_a_day_gets_two_folders(tmp_path):
+    morning = archive.session_directory(
+        tmp_path, "Hos001", "DR001", "2026-07-28", "145_DR001_Hos001_10_30_10_45_2026_07_28")
+    afternoon = archive.session_directory(
+        tmp_path, "Hos001", "DR001", "2026-07-28", "145_DR001_Hos001_15_00_15_20_2026_07_28")
+    assert morning != afternoon
+    assert morning.parent == afternoon.parent
+
+
+@pytest.mark.parametrize("folder", ["../escape", "a/b", "", "x" * 200])
+def test_folder_cannot_escape_the_archive(tmp_path, folder):
+    """The folder name is built from client-supplied fields, so it is validated."""
+    with pytest.raises(ArchiveError):
+        archive.session_directory(tmp_path, "HOSP001", "DR001", "2026-05-01", folder)
 
 
 # ============================================================
