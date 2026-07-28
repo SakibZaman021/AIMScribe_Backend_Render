@@ -185,7 +185,7 @@ class ArchiveWorker:
         session_date = session.get("session_date") or opened_local.date().isoformat()
         directory = archive.session_directory(
             self.settings.archive_root, session["hospital_id"],
-            session["doctor_id"], session_date)
+            session["doctor_id"], session_date, session["patient_ref"])
 
         filename = archive.archive_filename(
             patient_ref=session["patient_ref"], doctor_id=session["doctor_id"],
@@ -199,7 +199,7 @@ class ArchiveWorker:
         destination, already_ours = archive.free_destination(directory, filename, expected)
         relpath = archive.relative_path(
             session["hospital_id"], session["doctor_id"], session_date,
-            destination.name)
+            session["patient_ref"], destination.name)
 
         # Already done? Re-report rather than re-downloading; /archive/complete is
         # idempotent, and this is the normal path when a previous run was

@@ -37,8 +37,8 @@ def make_wav(path: Path, seconds: float, *, rate: int = SAMPLE_RATE,
 # ============================================================
 
 def test_builds_the_expected_tree(tmp_path):
-    directory = archive.session_directory(tmp_path, "HOSP001", "DR001", "2026-07-26")
-    assert directory == (tmp_path / "HOSP001" / "DR001" / "2026-07-26").resolve()
+    directory = archive.session_directory(tmp_path, "HOSP001", "DR001", "2026-07-26", "P1")
+    assert directory == (tmp_path / "HOSP001" / "DR001" / "2026-07-26" / "P1").resolve()
 
 
 @pytest.mark.parametrize("hospital", [
@@ -57,20 +57,20 @@ def test_builds_the_expected_tree(tmp_path):
 def test_traversal_in_hospital_is_rejected(tmp_path, hospital):
     """v1 joined a client-supplied id into a path and could write anywhere."""
     with pytest.raises(ArchiveError):
-        archive.session_directory(tmp_path, hospital, "DR001", "2026-07-26")
+        archive.session_directory(tmp_path, hospital, "DR001", "2026-07-26", "P1")
 
 
 @pytest.mark.parametrize("doctor", ["..", "../x", "C:/Windows", "dr 1", ""])
 def test_traversal_in_doctor_is_rejected(tmp_path, doctor):
     with pytest.raises(ArchiveError):
-        archive.session_directory(tmp_path, "HOSP001", doctor, "2026-07-26")
+        archive.session_directory(tmp_path, "HOSP001", doctor, "2026-07-26", "P1")
 
 
 @pytest.mark.parametrize("bad_date", ["2026-7-26", "26-07-2026", "../2026-07-26",
                                       "2026-07-26/..", "", "not-a-date"])
 def test_bad_date_is_rejected(tmp_path, bad_date):
     with pytest.raises(ArchiveError):
-        archive.session_directory(tmp_path, "HOSP001", "DR001", bad_date)
+        archive.session_directory(tmp_path, "HOSP001", "DR001", bad_date, "P1")
 
 
 def test_filename_shape():
@@ -78,9 +78,9 @@ def test_filename_shape():
     opened = datetime(2026, 5, 1, 9, 30, tzinfo=timezone.utc)
     closed = datetime(2026, 5, 1, 10, 15, tzinfo=timezone.utc)
     name = archive.archive_filename(
-        patient_ref="10045", doctor_id="DR001", hospital_id="HOSP001",
+        patient_ref="145", doctor_id="DR001", hospital_id="Hos001",
         opened_at=opened, closed_at=closed)
-    assert name == "10045_DR001_HOSP001_0930-1015_20260501.wav"
+    assert name == "145_DR001_Hos001_09_30_10_15_2026_05_01.wav"
 
 
 def test_filename_carries_no_session_ulid():
@@ -90,7 +90,8 @@ def test_filename_carries_no_session_ulid():
         opened_at=datetime(2026, 5, 1, 9, 30, tzinfo=timezone.utc),
         closed_at=datetime(2026, 5, 1, 10, 15, tzinfo=timezone.utc))
     assert not archive.ULID_PATTERN.search(name.replace("_", " "))
-    assert name.count("_") == 4
+    # patient, doctor, hospital, HH, MM, HH, MM, YYYY, MM, DD
+    assert name.count("_") == 9
 
 
 def test_date_comes_from_the_local_open_time():
@@ -100,7 +101,7 @@ def test_date_comes_from_the_local_open_time():
     name = archive.archive_filename(
         patient_ref="10045", doctor_id="DR001", hospital_id="HOSP001",
         opened_at=opened, closed_at=closed)
-    assert name == "10045_DR001_HOSP001_2350-0020_20260501.wav"
+    assert name == "10045_DR001_HOSP001_23_50_00_20_2026_05_01.wav"
 
 
 @pytest.mark.parametrize("patient", ["../x", "P 12345", "", "a" * 100])
@@ -151,10 +152,25 @@ def test_free_destination_steps_aside_for_a_different_session(tmp_path):
 def test_relative_path_has_no_root():
     """Absolute paths in the database break the day the volume is remounted."""
     rel = archive.relative_path(
-        "HOSP001", "DR001", "2026-05-01", "10045_DR001_HOSP001_0930-1015_20260501.wav")
-    assert rel == "HOSP001/DR001/2026-05-01/10045_DR001_HOSP001_0930-1015_20260501.wav"
+        "HOSP001", "DR001", "2026-05-01", "10045",
+        "10045_DR001_HOSP001_09_30_10_15_2026_05_01.wav")
+    assert rel == ("HOSP001/DR001/2026-05-01/10045/"
+                   "10045_DR001_HOSP001_09_30_10_15_2026_05_01.wav")
     assert not rel.startswith("/")
     assert ":" not in rel
+
+
+def test_session_directory_includes_the_patient(tmp_path):
+    """One folder per consultation: the audio and its manifest together."""
+    d = archive.session_directory(tmp_path, "HOSP001", "DR001", "2026-05-01", "10045")
+    assert d == tmp_path.resolve() / "HOSP001" / "DR001" / "2026-05-01" / "10045"
+
+
+@pytest.mark.parametrize("patient", ["../escape", "a/b", "", "x" * 100])
+def test_patient_cannot_escape_the_archive(tmp_path, patient):
+    """The patient reference now reaches a directory name, so it is validated."""
+    with pytest.raises(ArchiveError):
+        archive.session_directory(tmp_path, "HOSP001", "DR001", "2026-05-01", patient)
 
 
 # ============================================================

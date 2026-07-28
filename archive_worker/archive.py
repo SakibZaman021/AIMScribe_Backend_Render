@@ -56,20 +56,28 @@ def _checked(value: str, pattern: re.Pattern, field: str) -> str:
     return value
 
 
-def session_directory(root: Path, hospital_id: str, doctor_id: str, session_date: str) -> Path:
+def session_directory(root: Path, hospital_id: str, doctor_id: str,
+                      session_date: str, patient_ref: str) -> Path:
     """
-    Build <root>/<HOSPITAL>/<DOCTOR>/<YYYY-MM-DD> and prove it stays under root.
+    Build <root>/<HOSPITAL>/<DOCTOR>/<YYYY-MM-DD>/<PATIENT> and prove it stays
+    under root.
+
+    The patient level means one folder holds everything from one consultation -
+    the audio and its manifest together - so retrieving a patient's record is
+    opening a folder rather than filtering a day's files by name.
 
     Two independent defences: a strict allowlist pattern per component, and a
     resolved-path containment check. Either alone would probably do; together they
-    survive one of them being wrong.
+    survive one of them being wrong. Every component reaches a filesystem path and
+    every one of them originates from a client.
     """
     _checked(hospital_id, ID_PATTERN, "hospital_id")
     _checked(doctor_id, ID_PATTERN, "doctor_id")
     _checked(session_date, DATE_PATTERN, "session_date")
+    _checked(patient_ref, ID_PATTERN, "patient_ref")
 
     root = root.resolve()
-    target = (root / hospital_id / doctor_id / session_date).resolve()
+    target = (root / hospital_id / doctor_id / session_date / patient_ref).resolve()
 
     if not _is_within(target, root):
         raise ArchiveError(f"resolved path escapes the archive root: {target}")
@@ -89,26 +97,27 @@ def archive_filename(
     opened_at: datetime, closed_at: datetime
 ) -> str:
     """
-    `{patient}_{doctor}_{hospital}_{HHMM}-{HHMM}_{YYYYMMDD}.wav`
+    `{patient}_{doctor}_{hospital}_{HH}_{MM}_{HH}_{MM}_{YYYY}_{MM}_{DD}.wav`
 
-        10045_DR001_HOSP001_0930-1015_20260501.wav
+        145_DR001_Hos001_10_30_10_45_2026_07_28.wav
 
     Times are the hospital's local clock, and they are what keeps the name unique:
     without them a second consultation for the same patient on the same day would
     collide. The session ULID stays the database key but is deliberately absent
     here, because a name nobody can read is a name nobody can audit.
 
-    The patient reference is here because the folder has to be browsable by
-    patient. That is acceptable on this volume only - it is encrypted and
-    access-controlled - and it must never appear in an object key, a URL or a log
-    line, where it would leak into access logs and metrics.
+    Every field is underscore-separated by request. That makes the name easy to
+    read and awkward to parse - the start time is fields 4 and 5, the end time 6
+    and 7 - so anything that needs the times should read sessions.start_time and
+    sessions.end_time rather than taking them apart again.
     """
     _checked(patient_ref, ID_PATTERN, "patient_ref")
     _checked(doctor_id, ID_PATTERN, "doctor_id")
     _checked(hospital_id, ID_PATTERN, "hospital_id")
     return (f"{patient_ref}_{doctor_id}_{hospital_id}"
-            f"_{opened_at.strftime('%H%M')}-{closed_at.strftime('%H%M')}"
-            f"_{opened_at.strftime('%Y%m%d')}.wav")
+            f"_{opened_at.strftime('%H_%M')}"
+            f"_{closed_at.strftime('%H_%M')}"
+            f"_{opened_at.strftime('%Y_%m_%d')}.wav")
 
 
 def expected_join_bytes(segment_bytes: List[int]) -> int:
@@ -151,14 +160,15 @@ def free_destination(directory: Path, filename: str, expected_bytes: int) -> Tup
     raise ArchiveError(f"could not find a free archive name for {filename}")
 
 
-def relative_path(hospital_id: str, doctor_id: str, session_date: str, filename: str) -> str:
+def relative_path(hospital_id: str, doctor_id: str, session_date: str,
+                  patient_ref: str, filename: str) -> str:
     """
     Stored in the database, always relative to the archive root.
 
     An absolute path would break every row the day the volume is remounted or the
     archive moves to bigger disks.
     """
-    return f"{hospital_id}/{doctor_id}/{session_date}/{filename}"
+    return f"{hospital_id}/{doctor_id}/{session_date}/{patient_ref}/{filename}"
 
 
 def local_times(
