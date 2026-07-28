@@ -245,7 +245,7 @@ class V2Repository:
     async def close_session(
         self, session_id: str, *, closed_at: datetime, duration_seconds: float,
         paused_seconds: float, segment_count: int, chain_head: bytes,
-        manifest: Dict[str, Any],
+        manifest: Dict[str, Any], close_reason: str = "",
     ) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute("""
@@ -253,7 +253,8 @@ class V2Repository:
                    SET closed_at = $2, total_duration_seconds = $3,
                        paused_seconds = $4, segment_count = $5,
                        chain_head_hash = $6, chain_verified_at = now(),
-                       manifest = $7, status = 'closed', updated_at = now(),
+                       manifest = $7, close_reason = $8,
+                       status = 'closed', updated_at = now(),
 
                        -- Wall-clock columns, in the hospital's own timezone, so
                        -- what the console shows matches the filename. opened_at
@@ -266,7 +267,8 @@ class V2Repository:
                   FROM hospitals h
                  WHERE s.session_id = $1 AND h.hospital_id = s.hospital_id
             """, session_id, closed_at, duration_seconds, paused_seconds,
-                 segment_count, chain_head, json.dumps(manifest, ensure_ascii=False))
+                 segment_count, chain_head, json.dumps(manifest, ensure_ascii=False),
+                 close_reason or None)
 
     async def quarantine_session(self, session_id: str, reason: str) -> None:
         async with self._pool.acquire() as conn:
@@ -400,6 +402,43 @@ class V2Repository:
                 FROM segments WHERE session_id = $1 ORDER BY seq_no
             """, session_id)
         return [dict(row) for row in rows]
+
+    async def doctor_is_credentialed(self, doctor_id: str, hospital_id: str) -> bool:
+        """
+        May this doctor record at this hospital?
+
+        Checked on every session open. The doctor now comes from CMED so that a
+        consulting-room PC can be shared - which means the browser names them
+        again, and the browser is not trusted. The register is what makes a
+        rotating doctor safe and DR_TEST_001 impossible.
+        """
+        async with self._pool.acquire() as conn:
+            return bool(await conn.fetchval("""
+                SELECT 1 FROM doctors
+                 WHERE doctor_id = $1 AND hospital_id = $2 AND active
+            """, doctor_id, hospital_id))
+
+    async def doctors_at(self, hospital_id: str) -> List[Dict[str, Any]]:
+        """The register for one hospital, for the CMED selector."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT doctor_id, full_name FROM doctors
+                 WHERE hospital_id = $1 AND active
+                 ORDER BY full_name
+            """, hospital_id)
+        return [dict(r) for r in rows]
+
+    async def upsert_doctor(self, *, doctor_id: str, hospital_id: str,
+                            full_name: str, active: bool = True) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO doctors (doctor_id, hospital_id, full_name, active)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (doctor_id, hospital_id) DO UPDATE
+                   SET full_name = excluded.full_name,
+                       active    = excluded.active,
+                       updated_at = now()
+            """, doctor_id, hospital_id, full_name, active)
 
     async def pauses_for(self, session_id: str) -> List[Dict[str, Any]]:
         """

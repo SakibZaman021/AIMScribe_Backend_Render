@@ -13,8 +13,12 @@ mints one single-use token per PC, and writes a folder of one-page instructions
     HOSP002,United Hospital,DR003,Dr Kamrul Hasan,OPD 2
 
 One token per PC, not per doctor: the token is consumed at enrolment, and it is
-what binds that machine to that doctor. A doctor with two machines needs two
-rows.
+what binds that machine to a hospital. A doctor with two machines needs two rows.
+
+Every doctor named in the CSV is also added to their hospital's register, which
+is what lets them be picked in CMED. A consulting room is shared, so any doctor
+registered at that hospital can record on any of its PCs - the doctor named on
+the row is only that machine's default.
 
 The tokens are credentials. The output folder is written with no world access
 and should be deleted once the machines are installed; a token is useless after
@@ -101,7 +105,21 @@ ON THAT DOCTOR'S PC
   3. Install. When it finishes it should say the PC is ready to record.
 
   4. Open https://aim-scribe-exe.vercel.app in the browser on that PC.
-     The page should show {row['hospital_id']} and {row['doctor_id']}.
+     The page should show {row['hospital_id']}, and offer {row['doctor_name']}
+     in the doctor list with {row['doctor_id']} already selected.
+
+
+WHEN A DIFFERENT DOCTOR USES THIS PC
+{'-' * 62}
+
+  Nothing needs reinstalling. The consulting room belongs to the hospital,
+  not to one doctor - so whoever is seeing the patient picks their own name
+  from the list on the page before pressing Start, and the consultation is
+  filed under them.
+
+  A doctor missing from that list has not been registered at
+  {row['hospital_id']} yet. Ask for them to be added; it takes a moment and
+  needs no change on this PC.
 
 
 IF SOMETHING IS WRONG
@@ -173,6 +191,19 @@ def main() -> int:
                 continue
             hospitals_done.add(hospital)
             print(f"  hospital {hospital} ready")
+
+        # Register the doctor before minting the token. Enrolling a PC whose
+        # doctor cannot be picked in CMED produces a machine that installs
+        # cleanly and then refuses every consultation.
+        status, body = call("/api/v2/admin/doctor", {
+            "doctor_id": doctor, "hospital_id": hospital,
+            "full_name": (row.get("doctor_name") or doctor).strip(),
+            "active": True,
+        }, key)
+        if status != 200:
+            print(f"  {doctor}: register failed: {status} {body}")
+            failures += 1
+            continue
 
         status, body = call("/api/v2/admin/enrollment-token", {
             "hospital_id": hospital, "doctor_id": doctor,

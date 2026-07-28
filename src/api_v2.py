@@ -173,6 +173,7 @@ class ChainEntryRequest(BaseModel):
 class CloseRequest(BaseModel):
     session_id: str
     closed_at: Optional[str] = None
+    close_reason: str = Field("", max_length=64)
     duration_seconds: float = Field(0, ge=0)
     paused_seconds: float = Field(0, ge=0)
     segment_count: int = Field(0, ge=0)
@@ -330,6 +331,30 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
             detail={"device_hospital": device["hospital_id"], "claimed": hospital_id},
         )
         hospital_id = device["hospital_id"]
+
+    # The doctor comes from CMED, because a consulting-room PC is shared and the
+    # doctor using it changes. That means the browser names them, so the name is
+    # checked against the register for this hospital before anything is recorded.
+    # Without this, free text returns and with it DR_TEST_001 and a folder in the
+    # archive nobody will ever open.
+    if not await _repo().doctor_is_credentialed(doctor_id, hospital_id):
+        fallback = device.get("doctor_id")
+        if fallback and await _repo().doctor_is_credentialed(fallback, hospital_id):
+            # The machine's own doctor is a safe default when CMED names someone
+            # unrecognised - better a consultation attributed to the room's usual
+            # doctor than one attributed to nobody.
+            logger.warning("Doctor %r is not credentialed at %s; using the device's %r",
+                           doctor_id, hospital_id, fallback)
+            await _repo().raise_alert(
+                alert_type="doctor_not_credentialed", severity="warning",
+                session_id=session_id, device_id=device["device_id"],
+                detail={"claimed": doctor_id, "used": fallback, "hospital": hospital_id})
+            doctor_id = fallback
+        else:
+            raise HTTPException(
+                status_code=403,
+                detail=(f"{doctor_id} is not registered to record at {hospital_id}. "
+                        f"Ask an administrator to add them."))
 
     genesis = await _entry_or_400(body.genesis)
     if genesis.entry_no != 0 or genesis.entry_type != "open":
@@ -756,12 +781,29 @@ async def close_session(body: CloseRequest, device=Depends(require_device)):
         segment_count=len(stored_segments),
         chain_head=chain_head,
         manifest=body.manifest or {},
+        close_reason=body.close_reason,
     )
+
+    # A consultation normally ends because the doctor pressed Stop in CMED.
+    # Anything else - stopped from the tray icon, superseded by the next patient,
+    # recovered after the PC died mid-consultation - is worth someone's attention
+    # the same morning, not a fact buried in a log file on a machine in a
+    # consulting room.
+    if body.close_reason and body.close_reason != "doctor_stopped":
+        await repo.raise_alert(
+            alert_type="abnormal_close", severity="warning",
+            session_id=session_id, device_id=device["device_id"],
+            detail={"reason": body.close_reason,
+                    "duration_seconds": body.duration_seconds,
+                    "segments": len(stored_segments)})
+        logger.warning("Session %s ended abnormally: %s", session_id, body.close_reason)
+
     await repo.audit(
         event_type="session.closed", actor_type="device",
         device_id=device["device_id"], session_id=session_id,
         detail={"duration_seconds": body.duration_seconds,
-                "paused_seconds": body.paused_seconds, **summary},
+                "paused_seconds": body.paused_seconds,
+                "close_reason": body.close_reason or "doctor_stopped", **summary},
     )
     logger.info("Session %s closed and verified: %s", session_id, summary["entry_counts"])
     return {"status": "closed", "chain_ok": True, **summary}
@@ -966,6 +1008,48 @@ async def admin_hospital(body: HospitalRequest, _: None = Depends(require_admin)
     hospital_id = safe_identifier(body.hospital_id, field="hospital_id")
     await _repo().upsert_hospital(hospital_id, body.name, body.timezone)
     return {"status": "ok", "hospital_id": hospital_id}
+
+
+class DoctorRequest(BaseModel):
+    doctor_id: str = Field(..., max_length=64)
+    hospital_id: str = Field(..., max_length=64)
+    full_name: str = Field(..., max_length=128)
+    active: bool = True
+
+
+@router.post("/admin/doctor")
+async def admin_doctor(body: DoctorRequest, _: None = Depends(require_admin)):
+    """
+    Add or update a doctor in a hospital's register.
+
+    This is what allows a doctor to record at that hospital. Setting active to
+    false stops new consultations without touching the ones already archived,
+    which still resolve to a name.
+    """
+    doctor_id = safe_identifier(body.doctor_id, field="doctor_id")
+    hospital_id = safe_identifier(body.hospital_id, field="hospital_id")
+    await _repo().upsert_doctor(doctor_id=doctor_id, hospital_id=hospital_id,
+                                full_name=body.full_name, active=body.active)
+    await _repo().audit(
+        event_type="doctor.registered", actor_type="admin",
+        actor_id=doctor_id,
+        detail={"hospital_id": hospital_id, "active": body.active})
+    return {"status": "ok", "doctor_id": doctor_id, "hospital_id": hospital_id,
+            "active": body.active}
+
+
+@router.get("/doctors")
+async def list_doctors(hospital_id: str, device=Depends(require_device)):
+    """
+    The register for one hospital, for the CMED selector.
+
+    Device-authenticated rather than admin: the page needs it on every
+    consultation, and a device may only ask about its own hospital.
+    """
+    hospital = safe_identifier(hospital_id, field="hospital_id")
+    if hospital != device["hospital_id"]:
+        raise HTTPException(status_code=403, detail="not your hospital")
+    return {"hospital_id": hospital, "doctors": await _repo().doctors_at(hospital)}
 
 
 @router.post("/admin/enrollment-token")
