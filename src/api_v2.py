@@ -929,7 +929,11 @@ class TokenRequest(BaseModel):
     # The machine being enrolled belongs to one doctor. Naming them here is the
     # only place a doctor is ever chosen, and an administrator does it.
     doctor_id: str = Field(..., max_length=64)
-    created_by: str = Field(..., max_length=128)
+    # Written into the audit trail against every device this token
+    # enrols, and kept for the retention period. Name the team or the
+    # role, not an individual who may leave.
+    created_by: str = Field(..., max_length=128,
+                            examples=["Team_AIMScribe"])
     ttl_hours: int = Field(72, ge=1, le=720)
 
 
