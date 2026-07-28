@@ -354,7 +354,8 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
         device_id=device["device_id"],
         session_date=await _local_date(hospital_id, opened_at),
         opened_at=opened_at,
-        object_prefix=object_prefix(patient_ref, doctor_id, hospital_id, local_opened),
+        object_prefix=object_prefix(patient_ref, doctor_id, hospital_id,
+                                    local_opened, session_id),
         audio=body.audio.model_dump(),
         consent_method=body.consent_method,
         genesis=genesis,
@@ -390,7 +391,7 @@ async def authorize_segment(body: AuthorizeRequest, device=Depends(require_devic
     # the prefix could not be formed, because a key that does not identify its
     # session is worse than one that cannot be read.
     prefix = session.get("object_prefix") or session["session_id"]
-    name = clip_name(session, body.seq_no) or f"seg_{body.seq_no:05d}.wav"
+    name = unique_clip_name(session, body.seq_no) or f"seg_{body.seq_no:05d}.wav"
     object_key = f"audio/{prefix}/{name}"
 
     loop = asyncio.get_event_loop()
@@ -502,11 +503,11 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
 
 
 def object_prefix(patient: str, doctor: str, hospital: str,
-                  local_opened: datetime) -> Optional[str]:
+                  local_opened: datetime, session_id: str) -> Optional[str]:
     """
-    `{patient}_{doctor}_{hospital}_{HHMM}_{YYYYMMDD}`
+    `{patient}_{doctor}_{hospital}_{HHMMSS}_{YYYYMMDD}_{tail}`
 
-        10045_DR001_HOSP001_0930_20260728
+        10045_DR001_HOSP001_093012_20260728_X97HT
 
     The folder a session's clips live under in object storage, so the storage
     console can be read by a human. Clips used to sit under the session ULID,
@@ -519,6 +520,13 @@ def object_prefix(patient: str, doctor: str, hospital: str,
 
     Times are the hospital's local clock, matching the archive filename.
 
+    Seconds and the last five characters of the session id are both here because
+    a minute is not unique. Pressing Start for a new patient closes the current
+    consultation and opens another in the same second; two sessions then shared
+    a prefix, and since clip names carry no session either, the second session's
+    first clip overwrote the first session's. Silently, in object storage, with
+    both rows looking correct in the database.
+
     Returns None if any component is unsafe, and the caller falls back to the
     ULID: a key that does not match the session is worse than an unreadable one.
     """
@@ -526,7 +534,9 @@ def object_prefix(patient: str, doctor: str, hospital: str,
         if not value or not _NAME_SAFE.match(str(value)):
             return None
     return (f"{patient}_{doctor}_{hospital}"
-            f"_{local_opened.strftime('%H%M')}_{local_opened.strftime('%Y%m%d')}")
+            f"_{local_opened.strftime('%H%M%S')}"
+            f"_{local_opened.strftime('%Y%m%d')}"
+            f"_{session_id[-5:]}")
 
 
 def clip_name(session: Dict[str, Any], seq_no: int) -> Optional[str]:
@@ -561,6 +571,20 @@ def clip_name(session: Dict[str, Any], seq_no: int) -> Optional[str]:
 
     return (f"{patient}_{doctor}_{hospital}"
             f"_{date.strftime('%Y%m%d')}_{seq_no:04d}.wav")
+
+
+def unique_clip_name(session: Dict[str, Any], seq_no: int) -> Optional[str]:
+    """
+    The clip name with the session's tail appended.
+
+    Used for the object key, where a collision overwrites audio. The readable
+    name stored in segments.clip_name stays as it is - it is scoped to a session
+    row and cannot collide there.
+    """
+    base = clip_name(session, seq_no)
+    if base is None:
+        return None
+    return f"{base[:-len('.wav')]}_{str(session['session_id'])[-5:]}.wav"
 
 
 async def _delete_bucket_objects(session_id: str) -> int:
