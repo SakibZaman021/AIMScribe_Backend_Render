@@ -480,6 +480,21 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
         raise HTTPException(status_code=400, detail="declared byte length does not match")
 
     entry = await _entry_or_400(body.chain_entry)
+
+    # A commit whose response was lost gets retried, and the entry arriving the
+    # second time is byte-identical to the one already stored. Verifying it
+    # against a head that has moved past it judged an intact session a forgery
+    # and quarantined it - which is exactly what happened to a real consultation:
+    # ten clips, all present and correct on both sides, held out of the archive.
+    #
+    # A duplicate is answered as the success it is. Only the original entry
+    # hashes to the stored value, so this cannot launder a tampered one.
+    if await repo.entry_already_stored(session_id, entry):
+        logger.info("Segment %s of %s was already committed; treating the retry "
+                    "as the success it is", body.seq_no, session_id)
+        return {"status": "committed", "seq_no": body.seq_no,
+                "object_key": body.object_key, "duplicate": True}
+
     expected_prev = await repo.chain_head(session_id)
     verdict = integrity.verify_entry(
         entry, expected_prev=expected_prev, device_pubkey=bytes(device["tpm_pubkey"]))
@@ -698,6 +713,10 @@ async def _append_lifecycle_entry(body: ChainEntryRequest, device, expected_type
     entry = await _entry_or_400(body.chain_entry)
     if entry.entry_type != expected_type:
         raise HTTPException(status_code=400, detail=f"expected a {expected_type} entry")
+
+    # Same as a segment commit: a redelivered pause is not a chain violation.
+    if await repo.entry_already_stored(session_id, entry):
+        return {"status": "recorded", "entry_no": entry.entry_no, "duplicate": True}
 
     expected_prev = await repo.chain_head(session_id)
     verdict = integrity.verify_entry(

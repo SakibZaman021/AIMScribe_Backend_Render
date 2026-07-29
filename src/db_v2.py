@@ -311,6 +311,24 @@ class V2Repository:
         async with self._pool.acquire() as conn:
             await self._insert_chain_entry(conn, session_id, entry)
 
+    async def entry_already_stored(self, session_id: str, entry: ChainEntry) -> bool:
+        """
+        Is this exact entry already in the chain?
+
+        A commit that succeeded but whose response was lost gets retried by the
+        agent. The entry arriving the second time is byte-identical, but the
+        stored head has moved past it, so verifying prev_hash judges it a
+        violation and quarantines a session that is perfectly intact. Comparing
+        the hash tells a duplicate from a forgery: only the original entry
+        hashes to the original value.
+        """
+        async with self._pool.acquire() as conn:
+            stored = await conn.fetchval("""
+                SELECT entry_hash FROM chain_entries
+                 WHERE session_id = $1 AND entry_no = $2
+            """, session_id, entry.entry_no)
+        return stored is not None and bytes(stored) == entry.entry_hash
+
     async def chain_head(self, session_id: str) -> Optional[bytes]:
         """Hash of the highest-numbered entry, or None for an empty chain."""
         async with self._pool.acquire() as conn:
