@@ -209,8 +209,25 @@ def main() -> int:
             "hospital_id": hospital, "doctor_id": doctor,
             "created_by": CREATED_BY, "ttl_hours": TTL_HOURS,
         }, key)
+
+        if status != 200 and not doctor:
+            # Older backends insist a token names a doctor. It decides nothing -
+            # the agent takes the doctor from CMED with each consultation and
+            # ignores whatever the token said - so a label derived from the room
+            # satisfies the old rule without inventing a person. It is written
+            # only on the token record; the doctor directory is left alone.
+            placeholder = ("PC_" + (room or f"{len(register) + 1}")
+                           ).upper().replace(" ", "_")[:64]
+            status, body = call("/api/v2/admin/enrollment-token", {
+                "hospital_id": hospital, "doctor_id": placeholder,
+                "created_by": CREATED_BY, "ttl_hours": TTL_HOURS,
+            }, key)
+            if status == 200:
+                print(f"  (backend still wants a doctor on the token; "
+                      f"labelled it {placeholder})")
+
         if status != 200:
-            print(f"  {doctor}: token failed: {status} {body}")
+            print(f"  {hospital} {room or ''}: token failed: {status} {body}")
             failures += 1
             continue
 
