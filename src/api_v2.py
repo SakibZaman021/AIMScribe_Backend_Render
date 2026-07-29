@@ -213,6 +213,29 @@ def _parse_time(value: Optional[str]) -> datetime:
         return datetime.now(timezone.utc)
 
 
+async def _verified_duplicate(session_id: str, entry, device) -> bool:
+    """
+    Is this the entry the backend already holds, arriving a second time?
+
+    A retry is verified in full - payload hash, entry hash, device signature -
+    against its *own* prev_hash. That runs every check except the comparison
+    with the stored head, which is the only one a legitimate retry can fail:
+    the head has moved past the entry precisely because it was already accepted.
+
+    Verifying matters. `parse_entry` carries the entry_hash it was given rather
+    than recomputing it, so a tampered payload sent with the original hash would
+    otherwise be waved through on the strength of that hash alone.
+    """
+    if not await _repo().entry_already_stored(session_id, entry):
+        return False
+    verdict = integrity.verify_entry(
+        entry, expected_prev=entry.prev_hash, device_pubkey=bytes(device["tpm_pubkey"]))
+    if not verdict.ok:
+        logger.warning("Entry %s of %s claims a stored hash but fails verification: %s",
+                       entry.entry_no, session_id, verdict.reason)
+    return verdict.ok
+
+
 async def _local_time(hospital_id: str, moment: datetime) -> datetime:
     """The same instant on the hospital's wall clock."""
     tz_name = await _repo().hospital_timezone(hospital_id)
@@ -489,7 +512,7 @@ async def commit_segment(body: CommitRequest, device=Depends(require_device)):
     #
     # A duplicate is answered as the success it is. Only the original entry
     # hashes to the stored value, so this cannot launder a tampered one.
-    if await repo.entry_already_stored(session_id, entry):
+    if await _verified_duplicate(session_id, entry, device):
         logger.info("Segment %s of %s was already committed; treating the retry "
                     "as the success it is", body.seq_no, session_id)
         return {"status": "committed", "seq_no": body.seq_no,
@@ -715,7 +738,7 @@ async def _append_lifecycle_entry(body: ChainEntryRequest, device, expected_type
         raise HTTPException(status_code=400, detail=f"expected a {expected_type} entry")
 
     # Same as a segment commit: a redelivered pause is not a chain violation.
-    if await repo.entry_already_stored(session_id, entry):
+    if await _verified_duplicate(session_id, entry, device):
         return {"status": "recorded", "entry_no": entry.entry_no, "duplicate": True}
 
     expected_prev = await repo.chain_head(session_id)

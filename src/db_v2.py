@@ -131,8 +131,47 @@ class V2Repository:
                 if row is None:
                     return None
                 if row["used_at"] is not None:
-                    logger.warning("Enrollment token replay attempt")
-                    return None
+                    # A token is single-use, but "used" is not the same as
+                    # "working". If the agent's write of its identity failed
+                    # after the server had already committed - a full disk, a
+                    # permissions problem, a crash between the two files - the
+                    # machine has no credential and its token is spent. It can
+                    # never recover on its own, and the only symptom is the PC
+                    # reporting that it is not enrolled while the server shows
+                    # it enrolled perfectly well. That happened.
+                    #
+                    # So a token may be presented again by the same machine, but
+                    # only while the device it created has never once been seen.
+                    # After the first heartbeat this is a replay and is refused.
+                    previous = await conn.fetchrow("""
+                        SELECT device_id, tpm_pubkey, last_seen_at
+                          FROM devices WHERE device_id = $1
+                    """, row["device_id"])
+                    if previous is None or previous["last_seen_at"] is not None:
+                        logger.warning("Enrollment token replay attempt")
+                        return None
+                    if bytes(previous["tpm_pubkey"]) != tpm_pubkey:
+                        # A different machine, or the same one with a new key.
+                        # Either way this is not the retry it claims to be.
+                        logger.warning("Enrollment retry presented a different device key")
+                        return None
+
+                    logger.warning(
+                        "Re-issuing credentials for device %s: it enrolled but was "
+                        "never seen, so its first attempt did not complete",
+                        previous["device_id"])
+                    await conn.execute("""
+                        UPDATE devices
+                           SET token_sha256 = $2, app_version = $3, machine_name = $4
+                         WHERE device_id = $1
+                    """, previous["device_id"], hash_token(device_token),
+                         app_version, machine_name)
+                    return {
+                        "device_id": str(previous["device_id"]),
+                        "hospital_id": row["hospital_id"],
+                        "doctor_id": row["doctor_id"],
+                        "device_token": device_token,
+                    }
                 if row["expires_at"] < _utcnow():
                     logger.warning("Expired enrollment token presented")
                     return None
