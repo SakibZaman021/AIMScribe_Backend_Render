@@ -345,34 +345,40 @@ async def open_session(body: OpenSessionRequest, device=Depends(require_device))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    # The device's hospital is authoritative for tenancy. A grant may legitimately
-    # name a different one for a roaming doctor, but it is recorded, not obeyed.
+    # CMED names the hospital as well as the doctor, and both are recorded as
+    # sent. Overriding the hospital with the device's meant a consultation
+    # triggered for one site was filed under another, silently and in the
+    # filename. A disagreement is worth knowing about - a laptop does not
+    # usually move - so it is raised, but it does not change the record.
     if hospital_id != device["hospital_id"]:
         await _repo().raise_alert(
             alert_type="hospital_mismatch", severity="warning",
             session_id=session_id, device_id=device["device_id"],
             detail={"device_hospital": device["hospital_id"], "claimed": hospital_id},
         )
-        hospital_id = device["hospital_id"]
 
-    # The doctor comes from CMED, because a consulting-room PC is shared and the
-    # doctor using it changes. That means the browser names them, so the name is
-    # checked against the register for this hospital before anything is recorded.
-    # Without this, free text returns and with it DR_TEST_001 and a folder in the
-    # archive nobody will ever open.
-    # Refused rather than reattributed. The agent already substitutes the
-    # machine's own doctor when CMED names nobody, so an unrecognised name
-    # arriving here is a real misconfiguration - and a consultation quietly filed
-    # under a doctor who was not in the room is worse than one that did not start.
-    if not await _repo().doctor_is_credentialed(doctor_id, hospital_id):
-        await _repo().raise_alert(
-            alert_type="doctor_not_credentialed", severity="warning",
-            session_id=session_id, device_id=device["device_id"],
-            detail={"claimed": doctor_id, "hospital": hospital_id})
-        raise HTTPException(
-            status_code=403,
-            detail=(f"{doctor_id} is not registered to record at {hospital_id}. "
-                    f"Ask an administrator to add them."))
+    # CMED decides who the doctor is, and this does not second-guess it.
+    #
+    # Doctors log in to CMED; it knows who is on shift, who was hired this week,
+    # and who is covering another site today. Refusing a doctor this service had
+    # not been told about stopped real consultations - the identity was never
+    # AIMScribe's to verify. What is still enforced is the device: an unenrolled
+    # laptop cannot reach this endpoint at all, which is the property that
+    # actually matters.
+    #
+    # The register is kept as a directory rather than a gate, so names and
+    # history stay readable and a doctor new to a site appears without anyone
+    # filing a request. Both writes are bookkeeping and are wrapped: a site this
+    # service has never heard of must not be the reason a consultation fails.
+    try:
+        await _repo().upsert_hospital(hospital_id, hospital_id,
+                                      os.getenv("AIMS_DEFAULT_TIMEZONE", "Asia/Dhaka"),
+                                      only_if_new=True)
+        await _repo().upsert_doctor(doctor_id=doctor_id, hospital_id=hospital_id,
+                                    full_name=doctor_id, only_if_new=True)
+    except Exception as exc:
+        logger.warning("Could not record %s/%s in the directory: %s",
+                       hospital_id, doctor_id, exc)
 
     genesis = await _entry_or_400(body.genesis)
     if genesis.entry_no != 0 or genesis.entry_type != "open":
