@@ -1029,9 +1029,10 @@ class HospitalRequest(BaseModel):
 
 class TokenRequest(BaseModel):
     hospital_id: str = Field(..., max_length=64)
-    # The machine being enrolled belongs to one doctor. Naming them here is the
-    # only place a doctor is ever chosen, and an administrator does it.
-    doctor_id: str = Field(..., max_length=64)
+    # Optional, and decides nothing. A laptop is shared across shifts, so the
+    # doctor comes from CMED with each consultation; a name here only labels the
+    # room in the paperwork.
+    doctor_id: str = Field("", max_length=64)
     # Written into the audit trail against every device this token
     # enrols, and kept for the retention period. Name the team or the
     # role, not an individual who may leave.
@@ -1098,7 +1099,12 @@ async def admin_enrollment_token(body: TokenRequest, _: None = Depends(require_a
     database leak cannot be used to enrol devices.
     """
     hospital_id = safe_identifier(body.hospital_id, field="hospital_id")
-    doctor_id = safe_identifier(body.doctor_id, field="doctor_id")
+    # Optional. A token binds a machine to a hospital, and that is all it
+    # decides - the doctor arrives from CMED with each consultation. A named
+    # doctor here is only a label for the room in the paperwork, and most
+    # laptops are shared across shifts and have none.
+    doctor_id = (safe_identifier(body.doctor_id, field="doctor_id")
+                 if body.doctor_id else "")
     token = await _repo().create_enrollment_token(
         hospital_id=hospital_id, doctor_id=doctor_id,
         created_by=body.created_by, ttl_hours=body.ttl_hours)

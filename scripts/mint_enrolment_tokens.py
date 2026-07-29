@@ -7,18 +7,20 @@ Reads a CSV of the machines to enrol, creates any hospital that does not exist,
 mints one single-use token per PC, and writes a folder of one-page instructions
 - one file per machine, plus a register of what was issued.
 
-    hospital_id,hospital_name,doctor_id,doctor_name,room
-    HOSP001,Square Hospital,DR001,Dr Sakib Zaman,Room 3
-    HOSP001,Square Hospital,DR002,Dr Ayesha Rahman,Room 4
-    HOSP002,United Hospital,DR003,Dr Kamrul Hasan,OPD 2
+    hospital_id,hospital_name,room,doctor_id,doctor_name
+    HOSP001,Square Hospital,Room 3,,
+    HOSP001,Square Hospital,Room 4,,
+    HOSP002,United Hospital,OPD 2,,
 
-One token per PC, not per doctor: the token is consumed at enrolment, and it is
-what binds that machine to a hospital. A doctor with two machines needs two rows.
+One row per LAPTOP, not per doctor. A token binds a machine to a hospital, and
+that is all it decides: the doctor comes from CMED with each consultation, so
+the same laptop serves the morning and afternoon shifts without being touched.
 
-Every doctor named in the CSV is also added to their hospital's register, which
-is what lets them be picked in CMED. A consulting room is shared, so any doctor
-registered at that hospital can record on any of its PCs - the doctor named on
-the row is only that machine's default.
+doctor_id and doctor_name are optional and only label the room in the paperwork.
+Leave them blank unless a machine has one regular user.
+
+One token per PC. It is consumed at enrolment and cannot be reused, so a room
+with two laptops needs two rows.
 
 The tokens are credentials. The output folder is written with no world access
 and should be deleted once the machines are installed; a token is useless after
@@ -73,15 +75,18 @@ def call(path: str, body: dict, key: str):
 
 
 def instructions(row: dict, token: str, expires: datetime) -> str:
-    return f"""AIMScribe installation - {row['doctor_name']} ({row['doctor_id']})
+    where = row.get("room") or "-"
+    return f"""AIMScribe installation - {row['hospital_name']}, {where}
 {'=' * 62}
 
   Hospital   {row['hospital_name']} ({row['hospital_id']})
-  Doctor     {row['doctor_name']} ({row['doctor_id']})
-  Room       {row.get('room') or '-'}
+  Room       {where}
 
   This token is for ONE PC. It is consumed on first use, so it cannot be
   used to set up a second machine.
+
+  It does NOT tie the machine to a doctor. Whoever is on shift is named by
+  CMED with each patient, so the same laptop serves every shift.
 
   Valid until {expires:%d %B %Y, %H:%M} UTC.
 
@@ -105,21 +110,16 @@ ON THAT DOCTOR'S PC
   3. Install. When it finishes it should say the PC is ready to record.
 
   4. Open https://aim-scribe-exe.vercel.app in the browser on that PC.
-     The page should show {row['hospital_id']}, and offer {row['doctor_name']}
-     in the doctor list with {row['doctor_id']} already selected.
+     The page should show {row['hospital_id']} and say the PC is ready.
 
 
 WHEN A DIFFERENT DOCTOR USES THIS PC
 {'-' * 62}
 
-  Nothing needs reinstalling. The consulting room belongs to the hospital,
-  not to one doctor - so whoever is seeing the patient picks their own name
-  from the list on the page before pressing Start, and the consultation is
-  filed under them.
-
-  A doctor missing from that list has not been registered at
-  {row['hospital_id']} yet. Ask for them to be added; it takes a moment and
-  needs no change on this PC.
+  Nothing needs doing. The laptop belongs to the hospital, not to a doctor.
+  CMED sends the doctor with each patient, so a morning doctor and an
+  afternoon doctor share the same machine and each consultation is filed
+  under whoever was actually seeing the patient.
 
 
 IF SOMETHING IS WRONG
@@ -173,9 +173,12 @@ def main() -> int:
 
     for row in rows:
         hospital = (row.get("hospital_id") or "").strip()
+        room = (row.get("room") or "").strip()
+        # Only the hospital is required. The doctor is optional and decides
+        # nothing - CMED names the doctor per consultation.
         doctor = (row.get("doctor_id") or "").strip()
-        if not hospital or not doctor:
-            print(f"  skipped: a row is missing hospital_id or doctor_id: {row}")
+        if not hospital:
+            print(f"  skipped: a row is missing hospital_id: {row}")
             failures += 1
             continue
 
@@ -192,18 +195,15 @@ def main() -> int:
             hospitals_done.add(hospital)
             print(f"  hospital {hospital} ready")
 
-        # Register the doctor before minting the token. Enrolling a PC whose
-        # doctor cannot be picked in CMED produces a machine that installs
-        # cleanly and then refuses every consultation.
-        status, body = call("/api/v2/admin/doctor", {
-            "doctor_id": doctor, "hospital_id": hospital,
-            "full_name": (row.get("doctor_name") or doctor).strip(),
-            "active": True,
-        }, key)
-        if status != 200:
-            print(f"  {doctor}: register failed: {status} {body}")
-            failures += 1
-            continue
+        # A named doctor is recorded in the directory so their real name shows
+        # up in reports rather than an id. It grants nothing: CMED decides who
+        # may record, and an unnamed row is perfectly normal.
+        if doctor:
+            call("/api/v2/admin/doctor", {
+                "doctor_id": doctor, "hospital_id": hospital,
+                "full_name": (row.get("doctor_name") or doctor).strip(),
+                "active": True,
+            }, key)
 
         status, body = call("/api/v2/admin/enrollment-token", {
             "hospital_id": hospital, "doctor_id": doctor,
@@ -217,7 +217,8 @@ def main() -> int:
         token = body["enrollment_token"]
         row.setdefault("doctor_name", doctor)
         row.setdefault("hospital_name", hospital)
-        (out / f"{hospital}_{doctor}.txt").write_text(
+        label = doctor or (room.replace(" ", "_") or f"PC{len(register) + 1}")
+        (out / f"{hospital}_{label}.txt").write_text(
             instructions(row, token, expires), encoding="utf-8", newline="\r\n")
 
         register.append({
@@ -225,9 +226,9 @@ def main() -> int:
             "doctor_name": row.get("doctor_name", ""), "room": row.get("room", ""),
             "issued_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "expires_at": expires.isoformat(timespec="seconds"),
-            "instructions_file": f"{hospital}_{doctor}.txt",
+            "instructions_file": f"{hospital}_{label}.txt",
         })
-        print(f"  {hospital}/{doctor}: token issued")
+        print(f"  {hospital} {room or label}: token issued")
 
     if register:
         # Deliberately no token column: the register says what was issued and to
