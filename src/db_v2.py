@@ -48,7 +48,19 @@ class V2Repository:
     # Hospitals
     # ============================================================
 
-    async def upsert_hospital(self, hospital_id: str, name: str, timezone_name: str) -> None:
+    async def upsert_hospital(self, hospital_id: str, name: str, timezone_name: str,
+                              only_if_new: bool = False) -> None:
+        """
+        `only_if_new` is for sites first seen on a trigger: record that they
+        exist without overwriting a name and timezone an administrator set.
+        """
+        if only_if_new:
+            async with self._pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO hospitals (hospital_id, name, timezone)
+                    VALUES ($1, $2, $3) ON CONFLICT (hospital_id) DO NOTHING
+                """, hospital_id, name, timezone_name)
+            return
         async with self._pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO hospitals (hospital_id, name, timezone)
@@ -429,8 +441,24 @@ class V2Repository:
         return [dict(r) for r in rows]
 
     async def upsert_doctor(self, *, doctor_id: str, hospital_id: str,
-                            full_name: str, active: bool = True) -> None:
+                            full_name: str, active: bool = True,
+                            only_if_new: bool = False) -> None:
+        """
+        Add or update a doctor in the directory.
+
+        `only_if_new` is for the session-open path, which records whoever CMED
+        named. It must not overwrite a real name with an id: an administrator
+        who entered "Dr Kamrul Hasan" should not have it flattened back to
+        "DR003" the next time that doctor records.
+        """
         async with self._pool.acquire() as conn:
+            if only_if_new:
+                await conn.execute("""
+                    INSERT INTO doctors (doctor_id, hospital_id, full_name, active)
+                    VALUES ($1, $2, $3, TRUE)
+                    ON CONFLICT (doctor_id, hospital_id) DO NOTHING
+                """, doctor_id, hospital_id, full_name)
+                return
             await conn.execute("""
                 INSERT INTO doctors (doctor_id, hospital_id, full_name, active)
                 VALUES ($1, $2, $3, $4)
