@@ -22,8 +22,14 @@ acknowledgement within a few working days.
 | Anything protocol 1 | **No.** Superseded and structurally insecure |
 
 Protocol 1 let the browser name its own hospital and had no authentication on
-any route. It is not supported and must not be redeployed. `aimslab-server/` in
-the agent repository is protocol-1 leftover code and must not be run.
+any route. It is not supported and must not be redeployed.
+
+In particular, the protocol-1 AIMS LAB upload server — an unauthenticated
+`POST /receive-recording` bound to `0.0.0.0:7000` — was removed in July 2026 and
+replaced by the outbound-only `archive_worker/`. An old working copy may still
+contain it. It must never be run: it accepts audio from anyone who can reach the
+port, enumerates patient identifiers over `GET /patients`, and writes outside the
+archive tree, where nothing is covered by the hash chain or purge receipts.
 
 ## What the system enforces
 
