@@ -5,6 +5,17 @@ This module is the mirror of the agent's `core/crypto.py`. Every constant and
 every hashing rule here must match it byte for byte, or valid chains will be
 rejected and the whole scheme becomes noise. If you change one side, change both.
 
+That requirement is no longer left to memory. `tests/wire_vectors.json` holds
+fixed inputs and the exact outputs the format requires; `tests/test_wire_
+compatibility.py` replays every one of them against the code below, and an
+identical copy of the vectors is checked into the agent repository where its
+test suite does the same. Change a rule here and this repository's own tests
+fail, with no need for the agent to be checked out.
+
+Regenerating the vectors redefines the protocol and is a two-repository change:
+run `recorder/scripts/gen_wire_vectors.py`, copy the result to both, and update
+`EXPECTED_SHA256` in both test files.
+
 Responsibilities:
 
 * **Verify chains.** Recompute what the agent claims, so a deleted, reordered or
@@ -26,6 +37,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from cryptography.exceptions import InvalidSignature
@@ -83,6 +95,13 @@ def _json_default(value: Any) -> str:
         return iso_utc(value)
     if isinstance(value, (bytes, bytearray)):
         return bytes(value).hex()
+    # Unreachable from the wire, where a payload has already been through JSON
+    # and holds only primitives. Present so this function is behaviourally
+    # identical to the agent's, which does serialise Path: two canonicalisers
+    # that accept different type sets are two canonicalisers, and the next
+    # payload field to carry one would hash on one side and raise on the other.
+    if isinstance(value, Path):
+        return str(value)
     raise TypeError(f"cannot serialise {type(value).__name__} for hashing")
 
 
