@@ -1,902 +1,467 @@
-# AIMScribe AI Backend
+# AIMScribe Backend
 
-<div align="center">
+The server side of AIMScribe: clinical consultation recording for AIMS LAB.
 
-**Bengali Medical NER Extraction System for Doctor-Patient Conversations**
+This service does **two separate jobs** that share a database and are otherwise
+independent:
 
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.109+-green.svg)](https://fastapi.tiangolo.com/)
-[![Azure OpenAI](https://img.shields.io/badge/Azure-OpenAI-orange.svg)](https://azure.microsoft.com/en-us/products/ai-services/openai-service)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-14+-blue.svg)](https://www.postgresql.org/)
+| Job | Path | What it guarantees |
+|---|---|---|
+| **Integrity & archive** (protocol 2) | `/api/v2/*` | Every recording reaches the hospital's archive complete, unaltered, and provably so |
+| **Bengali AI pipeline** (v1) | `/api/v1/*` | Transcription and medical entity extraction for prescriptions |
 
-</div>
+They are deliberately decoupled: if transcription fails, the audio is still
+archived and receipted. If the AI is down, nothing about the evidential path
+changes.
+
+The Windows agent and the CMED web app live in
+[AIMScribe.exe](https://github.com/SakibZaman021/AIMScribe.exe).
 
 ---
 
-## Table of Contents
+## Table of contents
 
-- [Overview](#overview)
-- [Key Features](#key-features)
-- [System Architecture](#system-architecture)
-- [Data Flow](#data-flow)
-- [Technology Stack](#technology-stack)
-- [Project Structure](#project-structure)
-- [Prerequisites](#prerequisites)
-- [Installation Guide (Windows)](#installation-guide-windows)
+- [Deployment](#deployment)
+- [Repository layout](#repository-layout)
+- [The integrity protocol](#the-integrity-protocol-apiv2)
+- [The AI pipeline](#the-ai-pipeline-apiv1)
+- [The archive worker](#the-archive-worker)
+- [Database](#database)
 - [Configuration](#configuration)
-- [Running the Project](#running-the-project)
-- [API Endpoints](#api-endpoints)
-- [Database Schema](#database-schema)
-- [NER Extraction Modules](#ner-extraction-modules)
-- [Troubleshooting](#troubleshooting)
-- [Quick Command Reference](#quick-command-reference)
+- [Running locally](#running-locally)
+- [Administration](#administration)
+- [Security posture](#security-posture)
 
 ---
 
-## Overview
+## Deployment
 
-AIMScribe Backend is the AI-powered core of the AIMScribe medical transcription system. It processes audio recordings from doctor-patient consultations and extracts structured medical data that can be used to auto-generate prescriptions.
+```
+   Consulting-room PCs              Vercel                    Render
+   ───────────────────              ──────                    ──────
+   AIMScribe agent  ──────────────► CMED web ────┐            FastAPI
+   (25 laptops, 7 clinics)          (grants)     │            ├── /api/v2  integrity
+          │                                      └──────────► └── /api/v1  AI
+          │  presigned PUT                                          │
+          ▼                                                         │
+   Cloudflare R2  ◄──────────────────────────────────────────────────┤
+   (transit only)                                                   │
+          │                                              Neon Postgres
+          │  presigned GET                               Redis (queue + cache)
+          ▼                                              Azure OpenAI
+   AIMS LAB server
+   archive_worker  ──── outbound only ────────────────► Render
+   D:\AIMSLAB_AUDIO_STORAGE
+```
 
-### The Problem
+The AIMS LAB server holds the actual patient audio and **has no inbound ports**.
+It pulls work from the backend and receives short-lived presigned URLs for
+exactly the objects it needs, so it never holds bucket credentials either.
 
-Doctors in Bangladesh spend significant time manually writing prescriptions during patient consultations. This reduces the time available for actual patient care and can lead to:
-- Illegible handwriting
-- Missing information
-- Delayed patient processing
-- Doctor fatigue
+| Component | Runs on |
+|---|---|
+| API | Render — `https://aimscribe-backend-render.onrender.com` |
+| Database | Neon (managed Postgres), `sslmode=require` |
+| Transit object storage | Cloudflare R2, S3 API, bucket `aimscribe-audio` |
+| Queue and cache | Redis |
+| Transcription | Azure OpenAI `gpt-4o-transcribe` |
+| NER | Azure OpenAI `gpt-5.2-chat` |
+| Archive | AIMS LAB server, `D:\AIMSLAB_AUDIO_STORAGE` |
 
-### The Solution
-
-AIMScribe listens to the doctor-patient conversation and automatically:
-1. **Transcribes** the Bengali audio with speaker identification
-2. **Extracts** medical entities (medications, diagnoses, symptoms, etc.)
-3. **Generates** structured prescription data
-4. **Displays** the information on a dashboard for doctor verification
+> **R2 is configured through the `MINIO_*` variables** because it is reached with
+> the same S3-compatible client. `MINIO_REGION` must be `auto` for R2 — the
+> region is part of the SigV4 signature, and a mismatch fails every presigned
+> request with `SignatureDoesNotMatch`.
 
 ---
 
-## Key Features
+## Repository layout
 
-| Feature | Description |
-|---------|-------------|
-| **Bengali Audio Transcription** | Uses GPT-4o-transcribe for accurate Bengali medical transcription |
-| **Speaker Diarization** | Automatically labels [ডাক্তার], [রোগী], [রোগীর সাথী] |
-| **Real-time Processing** | Processes audio clips as they arrive (streaming support) |
-| **Parallel NER Extraction** | 9 extraction modules run concurrently for speed |
-| **Chain-of-Thought Prompting** | Advanced reasoning for accurate entity extraction |
-| **Few-Shot Learning** | Bengali medical examples for context-aware extraction |
-| **Patient History Integration** | Fetches baseline data and previous medications |
-| **Follow-up Support** | Handles "continue same medicine" scenarios |
-| **Connection Pooling** | Optimized database connections for performance |
-| **Redis Caching** | Reduces redundant database queries |
-
----
-
-## System Architecture
-
-### High-Level Architecture Diagram
-
-```mermaid
-graph TB
-    subgraph "Client Layer"
-        A[AIMScribe.exe<br/>Desktop Application]
-    end
-
-    subgraph "API Layer"
-        B[FastAPI/Flask Server<br/>Port 6000]
-    end
-
-    subgraph "Message Queue"
-        C[Redis Queue<br/>Job Management]
-    end
-
-    subgraph "Processing Layer"
-        D[Worker Process]
-        E[TranscriberV2<br/>GPT-4o-transcribe]
-        F[NER Extractor<br/>Parallel Processing]
-    end
-
-    subgraph "AI Services"
-        G[Azure OpenAI<br/>GPT-4o-transcribe]
-        H[Azure OpenAI<br/>GPT-4o NER]
-    end
-
-    subgraph "Storage Layer"
-        I[(PostgreSQL<br/>Database)]
-        J[(MinIO<br/>Audio Storage)]
-        K[(Redis<br/>Cache)]
-    end
-
-    subgraph "Output Layer"
-        L[Doctor Dashboard<br/>NER Display]
-    end
-
-    A -->|Upload Audio Clip| B
-    B -->|Store Audio| J
-    B -->|Create Job| C
-    C -->|Pop Job| D
-    D -->|Download Audio| J
-    D -->|Transcribe| E
-    E -->|API Call| G
-    D -->|Extract Entities| F
-    F -->|API Calls| H
-    D -->|Save Results| I
-    D -->|Cache Data| K
-    L -->|Fetch NER| B
-    B -->|Query| I
 ```
+src/
+  main_fastapi.py      the deployed app: v1 routes + mounts the v2 router
+  api_v2.py            protocol 2 — enrolment, sessions, chain, archive, admin
+  db_v2.py             V2Repository
+  integrity.py         chain parsing/verification, ReceiptSigner, identifier safety
+  config.py            pydantic-settings, read from environment
+  worker_async.py      transcription + NER worker
+  main.py              legacy Flask entry point (superseded by main_fastapi)
+  worker.py            legacy sync worker
+  database/            postgres.py (sync), postgres_async.py (asyncpg)
+  message_queue/       redis_client.py, redis_async.py
+  storage/             minio_client.py — S3 client, used against R2
+  processing/          transcriber_v2..v4, ner_extractor
+  prompts/             NER and agent prompt templates
+  webhooks/            cmed_webhook.py
 
-### Component Architecture
+archive_worker/        runs on the AIMS LAB server, outbound only
+  worker.py            the poll loop
+  archive.py           joining, hashing, path construction
+  catalogue.py         _index.json / manifest.json
 
-```mermaid
-graph LR
-    subgraph "API Server"
-        A1["/api/upload-clip"]
-        A2["/api/session/id/ner"]
-        A3["/api/patient/id/baseline"]
-        A4["/health"]
-    end
-
-    subgraph "Worker Process"
-        W1[Job Consumer]
-        W2[Audio Downloader]
-        W3[Transcriber]
-        W4[NER Trigger]
-        W5[Result Saver]
-    end
-
-    subgraph "Processing Modules"
-        P1[TranscriberV2]
-        P2[NERExtractor]
-    end
-
-    subgraph "NER Modules - Parallel"
-        N1[Chief Complaints]
-        N2[Symptoms]
-        N3[Diagnosis]
-        N4[Medications]
-        N5[Tests]
-        N6[Examination]
-        N7[Follow-up]
-        N8[Advice]
-        N9[Referral]
-    end
-
-    W1 --> W2 --> W3 --> W4 --> W5
-    W3 --> P1
-    W4 --> P2
-    P2 --> N1
-    P2 --> N2
-    P2 --> N3
-    P2 --> N4
-    P2 --> N5
-    P2 --> N6
-    P2 --> N7
-    P2 --> N8
-    P2 --> N9
-```
-
-### Transcription Sequence Diagram
-
-```mermaid
-sequenceDiagram
-    participant Client as AIMScribe.exe
-    participant API as API Server
-    participant MinIO as MinIO Storage
-    participant Redis as Redis Queue
-    participant Worker as Worker
-    participant GPT as GPT-4o-transcribe
-    participant DB as PostgreSQL
-
-    Client->>API: POST /api/upload-clip (audio.wav)
-    API->>MinIO: Store audio file
-    MinIO-->>API: object_key
-    API->>DB: Create clip record (pending)
-    API->>Redis: Push job to queue
-    API-->>Client: job_id, status queued
-
-    Worker->>Redis: Pop job (blocking)
-    Redis-->>Worker: session_id, clip_number, object_key
-    Worker->>MinIO: Download audio
-    MinIO-->>Worker: audio bytes
-    Worker->>GPT: Transcribe (base64 audio)
-    GPT-->>Worker: Bengali transcript with speaker labels
-    Worker->>DB: Save transcript
-    Worker->>DB: Update cumulative transcript
-    Worker->>Redis: Invalidate cache
-```
-
-### NER Extraction Sequence Diagram
-
-```mermaid
-sequenceDiagram
-    participant Worker as Worker
-    participant DB as PostgreSQL
-    participant Redis as Redis Cache
-    participant NER as NER Extractor
-    participant GPT as GPT-4o
-    participant Pool as ThreadPoolExecutor
-
-    Worker->>DB: Get clip count
-
-    alt clip_count >= 2 OR is_final
-        Worker->>DB: Get full transcript
-        Worker->>Redis: Check patient baseline cache
-
-        alt Cache miss
-            Worker->>DB: Fetch patient baseline
-            Worker->>Redis: Cache baseline 1hr TTL
-        end
-
-        Worker->>Redis: Check previous medications cache
-
-        alt Cache miss and follow-up patient
-            Worker->>DB: Fetch last visit medications
-            Worker->>Redis: Cache medications 1hr TTL
-        end
-
-        Worker->>NER: extract_all transcript baseline prev_meds
-        NER->>Pool: Submit 9 parallel tasks
-
-        Pool->>GPT: Extract Chief Complaints
-        Pool->>GPT: Extract Symptoms
-        Pool->>GPT: Extract Diagnosis
-        Pool->>GPT: Extract Medications
-        Pool->>GPT: Extract Tests
-        Pool->>GPT: Extract Examination
-        Pool->>GPT: Extract Follow-up
-        Pool->>GPT: Extract Advice
-        Pool->>GPT: Extract Referral
-
-        Pool-->>NER: All results
-        NER-->>Worker: Combined NER JSON
-        Worker->>DB: Save NER result
-
-        alt is_final
-            Worker->>DB: Finalize session
-            Worker->>DB: Archive to previous_visits
-            Worker->>Redis: Invalidate all caches
-        end
-    end
-```
-
-### Database Entity Relationship Diagram
-
-```mermaid
-erDiagram
-    PATIENTS ||--o{ SESSIONS : has
-    PATIENTS ||--o{ HEALTH_SCREENING : has
-    PATIENTS ||--o{ PREVIOUS_VISITS : has
-    SESSIONS ||--o{ AUDIO_CLIPS : contains
-    SESSIONS ||--o{ NER_EXTRACTIONS : generates
-    SESSIONS ||--o| CUMULATIVE_TRANSCRIPTS : has
-
-    PATIENTS {
-        varchar patient_id PK
-        varchar name
-        int age
-        varchar gender
-        varchar phone
-        text address
-        varchar blood_group
-        timestamp created_at
-    }
-
-    HEALTH_SCREENING {
-        serial id PK
-        varchar patient_id FK
-        decimal height_cm
-        decimal weight_kg
-        varchar blood_pressure
-        boolean diabetes
-        boolean hypertension
-        text allergies
-        timestamp screening_date
-    }
-
-    SESSIONS {
-        varchar session_id PK
-        varchar patient_id FK
-        varchar doctor_id
-        varchar status
-        timestamp started_at
-        timestamp completed_at
-        int total_clips
-    }
-
-    AUDIO_CLIPS {
-        serial id PK
-        varchar session_id FK
-        int clip_number
-        varchar object_key
-        text transcript
-        varchar status
-        timestamp processed_at
-    }
-
-    NER_EXTRACTIONS {
-        serial id PK
-        varchar session_id FK
-        boolean is_final
-        jsonb medications
-        jsonb diagnosis
-        jsonb symptoms
-        jsonb tests
-        text full_transcript
-        timestamp created_at
-    }
-
-    CUMULATIVE_TRANSCRIPTS {
-        serial id PK
-        varchar session_id FK
-        text full_transcript
-        int last_clip_number
-        timestamp updated_at
-    }
-
-    PREVIOUS_VISITS {
-        serial id PK
-        varchar patient_id FK
-        varchar session_id FK
-        jsonb medications
-        jsonb diagnosis
-        timestamp visit_date
-    }
+scripts/
+  init_database.sql    base schema
+  002_v2_integrity.sql … 009_close_reason.sql   migrations, applied in order
+  mint_enrolment_tokens.py                      fleet enrolment
+  check_schema.py
 ```
 
 ---
 
-## Data Flow
+## The integrity protocol (`/api/v2`)
 
-### Complete System Flow Diagram
+Three flows, three credentials. **Every route here requires authentication** —
+the v1 routes have none.
 
-```mermaid
-flowchart TD
-    subgraph "1. Audio Capture"
-        A[Doctor speaks with Patient]
-        B[AIMScribe.exe records audio]
-        C[Audio split into 30-sec clips]
-    end
+| Header | Principal |
+|---|---|
+| `X-Device-Token` | An enrolled agent. Scoped to its own sessions. |
+| `X-Worker-Key` | The archive worker. |
+| `X-Admin-Key` | An administrator. |
 
-    subgraph "2. Upload and Queue"
-        D[POST /api/upload-clip]
-        E[Audio saved to MinIO]
-        F[Job pushed to Redis Queue]
-    end
+### Agent flow
 
-    subgraph "3. Transcription"
-        G[Worker pops job]
-        H[Download audio from MinIO]
-        I[GPT-4o-transcribe]
-        J[Bengali text with speaker labels]
-    end
-
-    subgraph "4. Transcript Management"
-        K[Save clip transcript]
-        L[Rebuild cumulative transcript]
-        M{Clips >= 2 OR Final?}
-    end
-
-    subgraph "5. Context Fetching"
-        N[Fetch patient demographics]
-        O[Fetch health screening baseline]
-        P[Fetch previous medications]
-    end
-
-    subgraph "6. NER Extraction"
-        Q[Parallel NER with ThreadPool]
-        R[9 modules extract entities]
-        S[Combine into JSON]
-    end
-
-    subgraph "7. Output"
-        T[Save NER to PostgreSQL]
-        U[Doctor Dashboard displays]
-        V[Prescription ready]
-    end
-
-    A --> B --> C --> D --> E --> F
-    F --> G --> H --> I --> J
-    J --> K --> L --> M
-    M -->|No| W[Wait for more clips]
-    M -->|Yes| N --> O --> P --> Q
-    Q --> R --> S --> T --> U --> V
+```
+POST /device/enroll          one-time token → device_id, hospital_id, device_token
+POST /session/open           ULID minted on the PC; genesis chain entry
+POST /segment/authorize      presigned PUT for exactly one segment
+POST /segment/commit         ← the important one
+POST /session/pause|resume   signed lifecycle entries
+POST /session/close          whole chain verified server-side
+GET  /session/{id}/receipts  purge receipts, once archived
+POST /heartbeat              state, spool pressure, pending segments
 ```
 
-### Audio Clip Processing Pipeline
+> **`/segment/commit` re-reads the uploaded object from R2 and recomputes its
+> SHA-256 before storing anything.** A client's claim about what it uploaded is
+> never taken on trust. A mismatch quarantines the session.
 
-```mermaid
-flowchart LR
-    subgraph "Clip 1"
-        A1[Audio 0-30s] --> B1[Transcribe] --> C1[Save to DB]
-    end
+### Worker flow
 
-    subgraph "Clip 2"
-        A2[Audio 30-60s] --> B2[Transcribe] --> C2[Save to DB]
-    end
-
-    subgraph "Clip 3"
-        A3[Audio 60-90s] --> B3[Transcribe] --> C3[Save to DB]
-    end
-
-    C1 --> D[Cumulative Transcript]
-    C2 --> D
-    C3 --> D
-
-    D --> E{Clips >= 2?}
-    E -->|Yes| F[Run NER Extraction]
-    E -->|No| G[Wait]
-
-    F --> H[NER JSON Result]
 ```
+GET  /archive/pending        sessions closed, verified, not archived
+POST /archive/complete       → backend issues the purge receipts
+```
+
+### Admin flow
+
+```
+POST /admin/hospital                 create or rename (never changes hospital_id)
+POST /admin/doctor                   directory entry for reports; grants nothing
+POST /admin/enrollment-token         single use, ttl_hours ge=1 le=720
+POST /admin/device/{id}/revoke       immediate
+GET  /admin/alerts                   open integrity alerts
+GET  /doctors?hospital_id=           device-authenticated
+```
+
+### Identity, and what the client may assert
+
+| Identity | Source | Client can set it? |
+|---|---|---|
+| Hospital | The device's enrolment record | **No** |
+| Doctor | The CMED grant, per consultation | Only from CMED's register |
+| Patient | The CMED grant | Only from CMED |
+
+A consulting room runs two shifts on one laptop, so the doctor cannot belong to
+the machine. The hospital never changes for a PC, so it is never asked of the
+client. `hospital_id` is also the top-level archive folder name and **must never
+change**; display names may be changed freely.
+
+### The hash chain
+
+Each session carries an append-only Ed25519 chain keyed by
+`(session_id, entry_no)`, covering open, every segment, every pause and resume,
+and close. Each entry commits to the previous entry's hash, and every entry is
+signed by the device key registered at enrolment.
+
+The chain is verified **on the server at close**. A broken chain quarantines the
+session rather than archiving it. A quarantined session is never repaired by
+hand — a chain that can be hand-repaired proves nothing.
+
+A retried entry is verified in full against its *own* `prev_hash`, which runs
+every check except comparison with the stored head — the only check a legitimate
+retry can fail, since the head moved past it precisely because it was accepted.
 
 ---
 
-## Technology Stack
-
-| Layer | Technology | Purpose |
-|-------|------------|---------|
-| **API Framework** | FastAPI / Flask | HTTP API endpoints |
-| **AI - Transcription** | Azure OpenAI GPT-4o-transcribe | Bengali audio to text |
-| **AI - NER** | Azure OpenAI GPT-5.2 | Entity extraction |
-| **Database** | PostgreSQL 14+ | Structured data storage |
-| **Cache & Queue** | Redis 7+ | Job queue and caching |
-| **Object Storage** | MinIO | Audio file storage |
-| **Parallelism** | ThreadPoolExecutor | Concurrent NER extraction |
-| **ORM** | psycopg2 / asyncpg | Database access |
-
----
-
-## Project Structure
+## The AI pipeline (`/api/v1`)
 
 ```
-aimscribe-backend/
-│
-├── .env                           # Environment configuration
-├── docker-compose.yml             # Docker services
-├── requirements.txt               # Python dependencies
-├── README.md                      # This file
-├── RUN_GUIDE.md                   # Quick start guide
-│
-├── Batch Scripts (Windows)
-│
-├── src/                           # Source code
-│   ├── main.py                    # Flask API server
-│   ├── main_fastapi.py            # FastAPI server (async)
-│   ├── worker.py                  # Job processor
-│   ├── worker_async.py            # Async job processor
-│   ├── config.py                  # Configuration management
-│   │
-│   ├── processing/                # AI processing modules
-│   │   ├── transcriber.py         # Whisper transcriber (legacy)
-│   │   ├── transcriber_v2.py      # GPT-4o-transcribe
-│   │   └── ner_extractor.py       # Parallel NER extraction
-│   │
-│   ├── database/                  # Database layer
-│   │   ├── postgres.py            # Sync PostgreSQL
-│   │   └── postgres_async.py      # Async PostgreSQL
-│   │
-│   ├── queue/                     # Message queue
-│   │   ├── redis_client.py        # Sync Redis
-│   │   └── redis_async.py         # Async Redis
-│   │
-│   ├── storage/                   # Object storage
-│   │   └── minio_client.py        # MinIO client
-│   │
-│   └── prompts/                   # AI prompts
-│       ├── agents/                # Agent system prompts
-│       └── ner/                   # NER extraction prompts
-│
-├── scripts/                       # Setup scripts
-│   ├── init_database.sql          # Database schema
-│   └── setup.py                   # Setup wizard
-│
-└── tests/                         # Test files
-    └── test_azure_apis.py         # API tests
+committed segment
+      │
+      ▼
+Redis queue ──► worker_async ──► Azure OpenAI gpt-4o-transcribe
+                                    Bengali, diarised:
+                                    [ডাক্তার] [রোগী] [রোগীর সাথী]
+                                          │
+                                          ▼
+                              transcripts (cumulative per session)
+                                          │
+                            ≥ NER_TRIGGER_CLIPS (2), or final
+                                          ▼
+                              ner_extractor → gpt-5.2-chat
+                              9 extractors in parallel
+                                          ▼
+                                    ner_results
+                                          │
+                              CMED dashboard → prescription
 ```
 
+The nine extractors: chief complaints, symptoms, diagnosis, medications, tests,
+examination, follow-up, advice, referral.
+
+Patient baseline and previous medications are fetched for context and cached in
+Redis for an hour — this is what makes "continue the same medicine" work on a
+follow-up visit.
+
+NER runs from two clips onward so structure appears while the consultation is
+still going, then again at close against the full transcript.
+
+### Sample output
+
+```json
+{
+  "chief_complaints": [{ "complaint": "জ্বর", "duration": "৩ দিন" }],
+  "symptoms": [{ "symptom": "মাথা ব্যথা", "severity": "moderate", "duration": "৩ দিন" }],
+  "diagnosis": [{ "condition": "Viral Fever", "type": "provisional" }],
+  "medications": [{
+    "name": "Paracetamol", "dose": "500mg",
+    "frequency": "৩ বার", "duration": "৫ দিন", "instructions": "খাবার পরে"
+  }],
+  "tests": [{ "test": "CBC", "urgency": "routine" }],
+  "follow_up": { "days": 5, "condition": "জ্বর না কমলে" },
+  "advice": ["প্রচুর পানি পান করুন", "বিশ্রাম নিন"]
+}
+```
+
+### v1 routes
+
+`/api/v1/session/create`, `/upload/request`, `/upload/complete`,
+`/session/{id}/status`, `/transcript/{id}`, `/ner/{id}`, `/doctor-review`,
+`/prescription`, plus `/health`.
+
 ---
 
-## Prerequisites
+## The archive worker
 
-### Required Software
+Runs on the AIMS LAB server. **Listens on no port and accepts no connections.**
 
-| Software | Version | Download Link |
-|----------|---------|---------------|
-| Python | 3.10+ | https://www.python.org/downloads/ |
-| Docker Desktop | Latest | https://www.docker.com/products/docker-desktop |
-| Git | Latest | https://git-scm.com/downloads |
+```
+1. GET  /api/v2/archive/pending    sessions closed, verified, not archived
+2. download each segment           verify sha256 against the manifest
+3. join into one WAV               atomic write, then fsync
+4. re-read from disk and hash      proves the bytes actually landed
+5. write manifest.json, _index.json
+6. POST /api/v2/archive/complete   backend issues the purge receipts
+```
 
-### Azure OpenAI Requirements
+A session is reported complete only after step 4. Any failure leaves it pending,
+the agent keeps its local audio, and the next pass retries.
 
-You need access to Azure OpenAI with the following deployments:
+### Archive layout
 
-| Deployment | Model | Purpose |
-|------------|-------|---------|
-| gpt-4o-transcribe | gpt-4o-audio-preview | Bengali audio transcription |
-| gpt-4o | gpt-5.2 | NER extraction |
+```
+D:\AIMSLAB_AUDIO_STORAGE\<HOSPITAL>\<DOCTOR>\<YYYY-MM-DD>\<CONSULTATION>\<CONSULTATION>.wav
+```
 
-### How to Get Azure OpenAI Credentials
+The date is the **hospital's local date**, resolved through its configured
+timezone. Using UTC would file an evening consultation at UTC+6 under the
+previous day — permanently, since `session_date` decides the folder once.
 
-1. Go to [Azure Portal](https://portal.azure.com)
-2. Navigate to **Azure OpenAI** service
-3. Create or select your resource
-4. Go to **Keys and Endpoint** in the left sidebar
-5. Copy **KEY 1** and **Endpoint**
-6. Go to **Azure OpenAI Studio** → **Deployments**
-7. Note your deployment names
-
----
-
-## Installation Guide (Windows)
-
-### Step 1: Navigate to the Project
+### Running it
 
 ```powershell
-cd path\to\AIMScribe_Backend_Render
+$env:AIMS_BACKEND_URL  = "https://aimscribe-backend-render.onrender.com"
+$env:AIMS_WORKER_KEY   = "<worker key>"
+$env:AIMS_ARCHIVE_ROOT = "D:\AIMSLAB_AUDIO_STORAGE"
+python archive_worker\worker.py
 ```
 
-### Step 2: Install Python Dependencies
+| Variable | Default | Purpose |
+|---|---|---|
+| `AIMS_POLL_SECONDS` | 30 | Poll interval |
+| `AIMS_BATCH_SIZE` | 5 | Sessions per pass |
+| `AIMS_DISK_HEADROOM_BYTES` | 20 GB | Refuses to write below this |
+| `AIMS_DOWNLOAD_TIMEOUT` | 600 | Per segment |
+| `AIMS_VERIFY_TLS` | true | Never disable |
 
-**Manual installation**
+The worker refuses to start if `AIMS_BACKEND_URL` is not HTTPS.
+
+---
+
+## Database
+
+Managed Postgres on Neon. Apply `scripts/init_database.sql`, then the numbered
+migrations in order.
+
+### Protocol-2 tables
+
+| Table | Holds |
+|---|---|
+| `hospitals` | `hospital_id` (**immutable** — the archive folder name), display name, timezone |
+| `doctors` | Directory for reports. Grants nothing. |
+| `devices` | One row per enrolled PC: pubkey, machine facts, `revoked_at` |
+| `enrollment_tokens` | `token_sha256` (**bytea; the plaintext is never stored**), expiry, `used_at`, `device_id` |
+| `sessions` | ULID id, identities, consent, times, `close_reason`, manifest, quarantine, archive path/hash/bytes, retention, legal hold |
+| `chain_entries` | `(session_id, entry_no)`, type, payload, hashes, signature |
+| `segments`, `clips` | Per-clip metadata |
+| `purge_receipts` | Signed proofs the agent may act on |
+| `integrity_alerts` | The operator's queue |
+| `audit_log` | **Append-only**, hash-linked |
+| `used_grants` | Server-side `jti` replay record |
+| `api_keys` | Hashed keys with scope and expiry |
+
+### AI tables
+
+`patients`, `health_screenings`, `transcripts`, `ner_results`,
+`previous_visits`, `prescription_data`, `doctor_reviews`.
+
+### Views
+
+`v_doctors`, `v_doctor_activity`, `v_doctor_register`, `v_audio_files`,
+`v_abnormal_closes`, `v_session_pauses`, `patient_recordings`.
+
+> `patient_recordings` is a **view**. `playing_with_neon` is a leftover
+> provisioning sample and can be dropped.
+
+### The append-only audit log
+
+A trigger raises on both `UPDATE` and `DELETE`:
+
+```
+audit_log is append-only; DELETE is not permitted
+```
+
+This is load bearing. The record that a session was opened, archived and later
+removed must outlive the session rows. **Any cleanup that includes `audit_log`
+rolls back its entire transaction and deletes nothing.**
+
+Child tables have foreign keys without cascades. To delete a set of sessions,
+attempt each child table inside a savepoint and retry the ones a constraint
+still blocks until the blocked set stops shrinking — that settles the order from
+the live constraint graph rather than hard-coding one a later migration would
+invalidate.
+
+---
+
+## Configuration
+
+All from the environment; `.env` is read locally and is **gitignored**.
+
+| Variable | Notes |
+|---|---|
+| `POSTGRES_HOST` / `_PORT` / `_DB` / `_USER` / `_PASSWORD` | Neon; `POSTGRES_SSLMODE=require` |
+| `POSTGRES_POOL_MIN` / `_MAX` | Default 2 / 10 |
+| `AZURE_TRANSCRIBE_ENDPOINT` / `_API_KEY` / `_DEPLOYMENT` / `_API_VERSION` | `gpt-4o-transcribe` |
+| `AZURE_NER_ENDPOINT` / `_API_KEY` / `_DEPLOYMENT` | `gpt-5.2-chat` |
+| `MINIO_ENDPOINT` | R2 S3 endpoint |
+| `MINIO_ACCESS_KEY` / `_SECRET_KEY` / `_BUCKET` | `aimscribe-audio` |
+| `MINIO_REGION` | **`auto`** for R2 |
+| `MINIO_SECURE` | `true` |
+| `REDIS_HOST` / `_PORT` / `_PASSWORD` / `_SSL` | `REDIS_SSL=true` for Upstash |
+| `AIMS_ADMIN_KEY` | Administration routes |
+| `AIMS_WORKER_KEY` | Archive worker |
+| `AIMS_RECEIPT_PRIVATE_KEY` | Ed25519; signs purge receipts. Its public half is pinned on every agent. |
+| `AIMS_ALLOWED_ORIGINS` | Exact browser origins for CORS |
+| `AIMSCRIBE_WEBHOOK_SECRET` | CMED NER webhook |
+| `NER_TRIGGER_CLIPS` | Default 2 |
+| `WORKER_CONCURRENCY` | |
+
+Never commit real values. The repository is public.
+
+---
+
+## Running locally
+
 ```powershell
-# Create virtual environment
 python -m venv venv
-
-# Activate virtual environment
 .\venv\Scripts\activate
-
-# Upgrade pip
-python -m pip install --upgrade pip
-
-# Install dependencies
 pip install -r requirements.txt
-pip install python-dotenv
 ```
 
-### Step 3: Start Docker Services
-
-**Make sure Docker Desktop is running first!**
-
-**Using command line**
-```powershell
-docker compose up -d
-```
-
-**Verify services are running:**
-```powershell
-docker compose ps
-```
-
-Expected output:
-```
-NAME                  STATUS
-aimscribe-postgres    running (healthy)
-aimscribe-redis       running (healthy)
-aimscribe-minio       running (healthy)
-```
-
-### Step 4: Configure Environment Variables
-
-Edit the `.env` file with your credentials:
+Provide Postgres, Redis and an S3-compatible store (Docker is fine for all
+three), fill in `.env`, then:
 
 ```powershell
-notepad .env
+python scripts\setup.py            # apply schema
+python tests\test_azure_apis.py    # verify Azure connectivity
 ```
 
-**Update these values:**
-```env
+Two processes:
 
-
-### Step 5: Initialize Database
-
-**Using command line**
 ```powershell
-.\venv\Scripts\activate
-python scripts/setup.py
+uvicorn src.main_fastapi:app --host 0.0.0.0 --port 6000   # API
+python src\worker_async.py                                # transcription + NER
 ```
 
-### Step 6: Test API Connections
+Check with `curl http://localhost:6000/health`.
 
-**Using command line**
-```powershell
-.\venv\Scripts\activate
-python tests/test_azure_apis.py
-```
+`src/main.py` and `src/worker.py` are the older Flask/sync entry points, kept for
+reference. The deployed app is `src/main_fastapi.py`.
 
 ---
 
-## Running the Project
+## Administration
 
-### Quick Start (Two Terminals Required)
+### Mint enrolment tokens
 
-You need to run **TWO** processes simultaneously:
+One row per **laptop**. A token binds a machine to a hospital and decides
+nothing else — the doctor arrives with each consultation from CMED.
 
-#### Terminal 1: API Server
+```csv
+hospital_id,hospital_name,room,doctor_id,doctor_name
+HOSP003,Dholpur,Room 1,,
+HOSP004,Shyampur,Room 1,,
+```
 
 ```powershell
-.\venv\Scripts\activate
-python src/main.py
+$env:AIMS_TOKEN_TTL_HOURS = "720"     # 30 days; 720 is the hard maximum
+python scripts\mint_enrolment_tokens.py scripts\laptops_add_20260804.csv
 ```
 
-Expected output:
-```
-2024-XX-XX 10:00:00 - INFO - AIMScribe AI Backend starting...
-2024-XX-XX 10:00:00 - INFO - Server running on http://0.0.0.0:6000
-```
+Writes one instruction sheet per PC plus a token-free `register.csv`.
 
-#### Terminal 2: Worker
+> The database stores only `sha256(token)`. **The plaintext exists nowhere but
+> that generated sheet.** If it is lost, mint a new one. Delete the folder once
+> the machines are installed.
 
-```powershell
-.\venv\Scripts\activate
-python src/worker.py
-```
+Write a new dated CSV rather than editing an existing one — these files are read
+as the register of what is deployed.
 
-Expected output:
-```
-2024-XX-XX 10:00:00 - WORKER - INFO - Initializing AIMScribe Worker...
-2024-XX-XX 10:00:00 - WORKER - INFO - TranscriberV2 initialized with model: gpt-4o-transcribe
-2024-XX-XX 10:00:00 - WORKER - INFO - Worker started. Listening on aimscribe:queue:transcription...
-```
+### Current fleet
 
-### Verify System is Running
+| `hospital_id` | Clinic |
+|---|---|
+| `HOSP001` | Karail |
+| `HOSP002` | Mirpur |
+| `HOSP003` | Dholpur |
+| `HOSP004` | Shyampur |
 
-```powershell
-curl http://localhost:6000/health
-```
-
-Expected response:
-```json
-{"status": "healthy", "version": "1.0.0"}
-```
-
-### Service URLs
-
-| Service | URL | Credentials |
-|---------|-----|-------------|
-| API Server | http://localhost:6000 | - |
-| MinIO Console | http://localhost:9001 | aimscribe / aimscribe123 |
-| PostgreSQL | localhost:5432 | aimscribe_user / aimscribe123 |
-| Redis | localhost:6379 | - |
+Naryanganj, Ershadnagar and Amader Susastho have no id yet.
 
 ---
 
-## API Endpoints
+## Security posture
 
-### Health Check
+**Enforced today**
 
-```http
-GET /health
+- Every `/api/v2` route authenticated; sessions scoped to the owning device.
+- Server-side re-hash of every uploaded object at commit.
+- Ed25519 chain per session, verified server-side at close; broken chain ⇒ quarantine.
+- Purge receipts, so local audio is deleted only against proof of a verified archive copy.
+- Append-only audit log enforced by trigger.
+- Enrolment tokens single-use, hospital-bound, stored only as SHA-256.
+- CORS restricted to exact origins, `allow_credentials=False`.
+- Archive worker holds no bucket credentials and accepts no inbound connections.
 
-Response:
-{
-    "status": "healthy",
-    "version": "1.0.0"
-}
-```
+**Known gaps**
 
-### Upload Audio Clip
+- `/api/v1` routes remain unauthenticated.
+- `AIMSCRIBE_WEBHOOK_SECRET` is hardcoded and should be rotated.
+- `D:\AIMSLAB_AUDIO_STORAGE` has no backup.
 
-```http
-POST /api/upload-clip
-Content-Type: multipart/form-data
-
-Parameters:
-- session_id: string (required)
-- clip_number: integer (required)
-- audio: file (required, .wav format)
-- is_final: boolean (optional, default: false)
-
-Response:
-{
-    "job_id": "uuid",
-    "session_id": "string",
-    "clip_number": 1,
-    "status": "queued"
-}
-```
-
-### Get NER Results
-
-```http
-GET /api/session/{session_id}/ner
-
-Response:
-{
-    "session_id": "string",
-    "is_final": true,
-    "chief_complaints": [...],
-    "symptoms": [...],
-    "diagnosis": [...],
-    "medications": [...],
-    "tests": [...],
-    "examination": {...},
-    "follow_up": {...},
-    "advice": [...],
-    "referral": [...]
-}
-```
-
-### Get Patient Baseline
-
-```http
-GET /api/patient/{patient_id}/baseline
-
-Response:
-{
-    "patient_id": "string",
-    "name": "রহিম উদ্দিন",
-    "age": 45,
-    "gender": "Male",
-    "health_screening": {
-        "blood_pressure": "140/90",
-        "diabetes": true,
-        "hypertension": true
-    }
-}
-```
+Report vulnerabilities privately to the AIMS LAB team; see [`SECURITY.md`](SECURITY.md).
 
 ---
 
-## NER Extraction Modules
-
-| Module | Output Type | Description |
-|--------|-------------|-------------|
-| Chief Complaints | Array | Primary reason for visit |
-| Symptoms | Array | Patient-reported symptoms with duration |
-| Diagnosis | Array | Doctor's diagnosis (provisional/confirmed) |
-| Medications | Array | Prescribed medicines with dosage |
-| Tests | Array | Ordered laboratory/imaging tests |
-| Examination | Object | Physical examination findings |
-| Follow-up | Object | Next appointment details |
-| Advice | Array | Lifestyle/dietary recommendations |
-| Referral | Array | Specialist referrals |
-
-### Sample NER Output
-
-```json
-{
-    "chief_complaints": [
-        {"complaint": "জ্বর", "duration": "৩ দিন"}
-    ],
-    "symptoms": [
-        {"symptom": "মাথা ব্যথা", "severity": "moderate", "duration": "৩ দিন"},
-        {"symptom": "শরীর ব্যথা", "severity": "mild"}
-    ],
-    "diagnosis": [
-        {"condition": "Viral Fever", "type": "provisional"}
-    ],
-    "medications": [
-        {
-            "name": "Paracetamol",
-            "dose": "500mg",
-            "frequency": "৩ বার",
-            "duration": "৫ দিন",
-            "instructions": "খাবার পরে"
-        }
-    ],
-    "tests": [
-        {"test": "CBC", "urgency": "routine"}
-    ],
-    "follow_up": {
-        "days": 5,
-        "condition": "জ্বর না কমলে"
-    },
-    "advice": [
-        "প্রচুর পানি পান করুন",
-        "বিশ্রাম নিন"
-    ]
-}
-```
-
----
-
-## Troubleshooting
-
-### Docker Issues
-
-**Docker services not starting:**
-```powershell
-# Check Docker is running
-docker info
-
-# Restart Docker Desktop, then retry
-docker compose up -d
-```
-
-**Port already in use:**
-```powershell
-# Check what's using port 5432
-netstat -ano | findstr :5432
-```
-
-### Database Issues
-
-**Connection refused:**
-```powershell
-# Check PostgreSQL container
-docker logs aimscribe-postgres
-
-# Restart container
-docker compose restart postgres
-```
-
-### Azure API Issues
-
-**Authentication error:**
-1. Verify API key in `.env` file
-2. Check the key is not expired
-3. Ensure no extra spaces in the key
-
-**Model not found:**
-1. Verify deployment name in Azure OpenAI Studio
-2. Ensure the deployment is active
-
-### Redis Issues
-
-**Connection refused:**
-```powershell
-docker exec aimscribe-redis redis-cli ping
-```
-
----
-
-## Quick Command Reference
-
-```powershell
-# Activate virtual environment
-.\venv\Scripts\activate
-
-# Start all Docker services
-docker compose up -d
-
-# Stop all Docker services
-docker compose down
-
-# View Docker logs
-docker compose logs -f
-
-# Run API tests
-python tests/test_azure_apis.py
-
-# Start API server
-python src/main.py
-
-# Start worker
-python src/worker.py
-
-# Check API health
-curl http://localhost:6000/health
-```
-
----
-
-## Performance Optimizations
-
-| Optimization | Improvement | Implementation |
-|--------------|-------------|----------------|
-| Connection Pooling | 12x faster DB access | ThreadedConnectionPool (min=2, max=10) |
-| Parallel NER | 4-5x faster extraction | ThreadPoolExecutor (9 workers) |
-| Redis Caching | Eliminates repeated queries | TTL-based caching (1 hour) |
-| Async I/O | Non-blocking operations | FastAPI + asyncpg |
-
----
-
-## License
-
-This project is proprietary software developed for AIMS Lab.
-
----
-
-## Support
-
-For issues and support:
-1. Check the [Troubleshooting](#troubleshooting) section
-2. Review Docker logs for errors
-3. Verify all environment variables are set correctly
-
----
-
-**Developed by AIMS Lab Research Team**
-
-© 2026 AIMScribe
+© 2026 AIMS LAB. Proprietary.
